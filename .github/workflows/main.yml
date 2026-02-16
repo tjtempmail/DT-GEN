@@ -21,7 +21,7 @@ jobs:
   generate:
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:22.04  # Use a full Ubuntu container for maximum compatibility
+      image: ubuntu:22.04
 
     steps:
       - name: Install system dependencies
@@ -29,6 +29,7 @@ jobs:
           apt-get update && apt-get install -y --no-install-recommends \
             python3 python3-pip python3-venv \
             curl wget unzip p7zip-full lz4 xz-utils \
+            git file \
             && rm -rf /var/lib/apt/lists/*
         shell: bash
 
@@ -45,14 +46,32 @@ jobs:
         shell: bash
 
       - name: Download ROM ZIP
+        id: download
         run: |
           echo "Downloading ROM from ${{ github.event.inputs.rom_url }} ..."
           curl -L -o rom.zip "${{ github.event.inputs.rom_url }}"
+          
           if [ ! -f rom.zip ]; then
-            echo "Download failed!"
+            echo "::error::Download failed - no file created."
             exit 1
           fi
-          echo "Download complete. File size: $(du -h rom.zip | cut -f1)"
+          
+          # Check file size
+          SIZE=$(stat -c %s rom.zip)
+          echo "Downloaded file size: $SIZE bytes"
+          
+          # ROM should be at least 100 MB (adjust threshold as needed)
+          if [ $SIZE -lt 100000000 ]; then
+            echo "::warning::Downloaded file is very small (${SIZE} bytes). It might not be a valid ROM."
+            # Optionally check MIME type
+            MIME=$(file --mime-type -b rom.zip)
+            if [ "$MIME" != "application/zip" ]; then
+              echo "::error::Downloaded file is not a ZIP (MIME: $MIME). The URL may not be a direct download link."
+              exit 1
+            fi
+          fi
+          
+          echo "Download successful. File: rom.zip ($(du -h rom.zip | cut -f1))"
         shell: bash
 
       - name: Extract partitions with dumpyara
@@ -61,17 +80,18 @@ jobs:
           mkdir -p dump_output
           echo "Running dumpyara on rom.zip ..."
           python -m dumpyara rom.zip -o dump_output
+          
           if [ ! -d dump_output/system ]; then
-            echo "dumpyara failed to extract system partition!"
+            echo "::error::dumpyara failed to extract system partition."
             exit 1
           fi
+          
           echo "dump_path=dump_output" >> $GITHUB_OUTPUT
         shell: bash
 
       - name: Generate device tree with aospdtgen
         id: generate
         run: |
-          # Determine output directory name
           if [ -z "${{ github.event.inputs.output_name }}" ]; then
             OUTPUT_DIR="device_tree_$(date +'%Y%m%d_%H%M%S')"
           else
@@ -88,7 +108,7 @@ jobs:
           eval $CMD
 
           if [ ! -d "$OUTPUT_DIR" ]; then
-            echo "aospdtgen failed to produce output directory!"
+            echo "::error::aospdtgen failed to produce output directory."
             exit 1
           fi
 
