@@ -58,7 +58,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
+          # REMOVED: cache: 'pip' (causes error when requirements.txt is missing)
 
       - name: 🛠️ Install System Dependencies
         run: |
@@ -201,18 +201,21 @@ jobs:
           # Detect and handle different ROM formats
           if [[ "${{ github.event.inputs.rom_type }}" == "auto-detect" ]]; then
             echo "🔍 Auto-detecting ROM format..."
-            python -m dumpyara "$ROM_PATH" "$EXTRACT_DIR" --output-format json 2>&1 | tee extraction.log
+            python -m dumpyara "$ROM_PATH" "$EXTRACT_DIR" --output-format json 2>&1 | tee extraction.log || true
           else
             echo "📦 Using specified format: ${{ github.event.inputs.rom_type }}"
-            python -m dumpyara "$ROM_PATH" "$EXTRACT_DIR" 2>&1 | tee extraction.log
+            python -m dumpyara "$ROM_PATH" "$EXTRACT_DIR" 2>&1 | tee extraction.log || true
           fi
           
           # Find the extracted dump directory (dumpyara creates subfolder)
-          DUMP_DIR=$(find "$EXTRACT_DIR" -maxdepth 2 -type d -name "*.dump" -o -type d -name "extracted*" 2>/dev/null | head -1)
+          DUMP_DIR=$(find "$EXTRACT_DIR" -maxdepth 2 -type d \( -name "*.dump" -o -name "extracted*" \) 2>/dev/null | head -1)
           
           if [ -z "$DUMP_DIR" ] || [ ! -d "$DUMP_DIR" ]; then
             # Fallback: use the directory with system/build.prop or vendor/build.prop
             DUMP_DIR=$(find "$EXTRACT_DIR" -name "build.prop" -type f -exec dirname {} \; 2>/dev/null | head -1)
+            if [ -n "$DUMP_DIR" ]; then
+              DUMP_DIR=$(dirname "$DUMP_DIR")  # Go up one level to get the partition root
+            fi
           fi
           
           if [ -z "$DUMP_DIR" ] || [ ! -d "$DUMP_DIR" ]; then
@@ -235,63 +238,87 @@ jobs:
         run: |
           DUMP_PATH="${{ steps.extract.outputs.dump_path }}"
           
+          echo "🔍 Scanning for device info in: $DUMP_PATH"
+          
           # Find build.prop files
           BUILD_PROP=$(find "$DUMP_PATH" -name "build.prop" -type f 2>/dev/null | head -1)
           VENDOR_PROP=$(find "$DUMP_PATH" -path "*/vendor/build.prop" -o -path "*/vendor/default.prop" 2>/dev/null | head -1)
           SYSTEM_PROP=$(find "$DUMP_PATH" -path "*/system/build.prop" 2>/dev/null | head -1)
           
-          echo "🔍 Scanning for device info..."
+          echo "Found build.prop files:"
+          echo "  Build: $BUILD_PROP"
+          echo "  Vendor: $VENDOR_PROP"
+          echo "  System: $SYSTEM_PROP"
           
           # Extract device info using Python script
-          python3 << 'EOF'
+          python3 << 'PYEOF'
           import os
           import re
           import json
+          import sys
           
           def parse_prop(file_path):
               props = {}
-              if os.path.exists(file_path):
-                  with open(file_path, 'r', errors='ignore') as f:
-                      for line in f:
-                          if '=' in line and not line.startswith('#'):
-                              key, val = line.strip().split('=', 1)
-                              props[key] = val
+              if file_path and os.path.exists(file_path):
+                  try:
+                      with open(file_path, 'r', errors='ignore') as f:
+                          for line in f:
+                              if '=' in line and not line.startswith('#'):
+                                  parts = line.strip().split('=', 1)
+                                  if len(parts) == 2:
+                                      key, val = parts
+                                      props[key] = val
+                  except Exception as e:
+                      print(f"Error reading {file_path}: {e}", file=sys.stderr)
               return props
           
           dump_path = os.environ.get('DUMP_PATH', '${{ steps.extract.outputs.dump_path }}')
           
           # Find all prop files
           prop_files = []
-          for root, dirs, files in os.walk(dump_path):
-              for file in files:
-                  if file.endswith('.prop'):
-                      prop_files.append(os.path.join(root, file))
+          if os.path.exists(dump_path):
+              for root, dirs, files in os.walk(dump_path):
+                  for file in files:
+                      if file.endswith('.prop'):
+                          prop_files.append(os.path.join(root, file))
+          
+          print(f"Found {len(prop_files)} .prop files")
           
           all_props = {}
-          for pf in prop_files:
+          for pf in prop_files[:10]:  # Limit to first 10 for performance
               all_props.update(parse_prop(pf))
           
-          # Extract key device info
+          # Extract key device info with fallbacks
           device_info = {
-              'brand': all_props.get('ro.product.brand', all_props.get('ro.product.vendor.brand', 'unknown')),
-              'manufacturer': all_props.get('ro.product.manufacturer', all_props.get('ro.product.vendor.manufacturer', 'unknown')),
-              'device': all_props.get('ro.product.device', all_props.get('ro.product.vendor.device', 'unknown')),
-              'model': all_props.get('ro.product.model', all_props.get('ro.product.vendor.model', 'unknown')),
-              'codename': all_props.get('ro.product.name', all_props.get('ro.product.vendor.name', 'unknown')),
+              'brand': all_props.get('ro.product.brand', 
+                      all_props.get('ro.product.vendor.brand', 
+                      all_props.get('ro.product.system.brand', 'unknown'))),
+              'manufacturer': all_props.get('ro.product.manufacturer',
+                             all_props.get('ro.product.vendor.manufacturer', 'unknown')),
+              'device': all_props.get('ro.product.device',
+                       all_props.get('ro.product.vendor.device', 'unknown')),
+              'model': all_props.get('ro.product.model',
+                      all_props.get('ro.product.vendor.model', 'unknown')),
+              'codename': all_props.get('ro.product.name',
+                         all_props.get('ro.product.vendor.name', 'unknown')),
               'android_version': all_props.get('ro.build.version.release', 'unknown'),
               'sdk_version': all_props.get('ro.build.version.sdk', 'unknown'),
               'security_patch': all_props.get('ro.build.version.security_patch', 'unknown'),
               'fingerprint': all_props.get('ro.build.fingerprint', 'unknown'),
-              'platform': all_props.get('ro.board.platform', all_props.get('ro.hardware', 'unknown')),
-              'arch': all_props.get('ro.product.cpu.abi', 'unknown'),
+              'platform': all_props.get('ro.board.platform',
+                        all_props.get('ro.hardware', 'unknown')),
+              'arch': all_props.get('ro.product.cpu.abi',
+                     all_props.get('ro.product.cpu.abi2', 'unknown')),
               'treble': all_props.get('ro.treble.enabled', 'false')
           }
           
-          # Write to GitHub outputs and file
-          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
-              for key, val in device_info.items():
-                  safe_val = str(val).replace('\n', ' ').replace('\r', '')
-                  print(f"{key}={safe_val}", file=f)
+          # Write to GitHub outputs
+          github_output = os.environ.get('GITHUB_OUTPUT')
+          if github_output:
+              with open(github_output, 'a') as f:
+                  for key, val in device_info.items():
+                      safe_val = str(val).replace('\n', ' ').replace('\r', '')
+                      print(f"{key}={safe_val}", file=f)
           
           # Save full info
           with open('device_info.json', 'w') as f:
@@ -299,14 +326,16 @@ jobs:
           
           print("📱 Device Information:")
           print(json.dumps(device_info, indent=2))
-          EOF
+          PYEOF
           
           # Override with user inputs if provided
           if [ -n "${{ github.event.inputs.device_codename }}" ]; then
             echo "codename=${{ github.event.inputs.device_codename }}" >> $GITHUB_OUTPUT
+            echo "🏷️ Using user-provided codename: ${{ github.event.inputs.device_codename }}"
           fi
           if [ -n "${{ github.event.inputs.brand }}" ]; then
             echo "brand=${{ github.event.inputs.brand }}" >> $GITHUB_OUTPUT
+            echo "🏢 Using user-provided brand: ${{ github.event.inputs.brand }}"
           fi
 
       # ============================================================================
@@ -321,44 +350,50 @@ jobs:
           # Create output directory
           mkdir -p "$OUTPUT_DIR"
           
-          # Prepare aospdtgen arguments
-          AOSPDTGEN_ARGS="-o \"$OUTPUT_DIR\""
-          
-          if [[ "${{ github.event.inputs.generate_proprietary }}" == "false" ]]; then
-            AOSPDTGEN_ARGS="$AOSPDTGEN_ARGS --no-proprietary-files"
-          fi
-          
           echo "🌳 Running aospdtgen..."
           echo "📂 Input: $DUMP_PATH"
           echo "📂 Output: $OUTPUT_DIR"
-          echo "⚙️ Args: $AOSPDTGEN_ARGS"
+          
+          # Check if dump path exists
+          if [ ! -d "$DUMP_PATH" ]; then
+            echo "❌ Dump path does not exist: $DUMP_PATH"
+            exit 1
+          fi
           
           # Run aospdtgen with error handling
           cd "$WORKSPACE"
           
-          if ! python -m aospdtgen $AOSPDTGEN_ARGS "$DUMP_PATH" 2>&1 | tee aospdtgen.log; then
-            echo "⚠️ aospdtgen encountered issues, checking output..."
-            # Continue even if there are non-fatal errors
+          # Build args
+          AOSP_ARGS="-o \"$OUTPUT_DIR\""
+          if [[ "${{ github.event.inputs.generate_proprietary }}" == "false" ]]; then
+            AOSP_ARGS="$AOSP_ARGS --no-proprietary-files"
+          fi
+          
+          echo "⚙️ Running: python -m aospdtgen $AOSP_ARGS \"$DUMP_PATH\""
+          
+          # Run with timeout and capture output
+          if ! timeout 300 python -m aospdtgen $AOSP_ARGS "$DUMP_PATH" 2>&1 | tee aospdtgen.log; then
+            echo "⚠️ aospdtgen completed with warnings or errors (check log above)"
+            # Don't exit - sometimes it partially succeeds
           fi
           
           # Verify output
           if [ ! -d "$OUTPUT_DIR" ] || [ -z "$(ls -A "$OUTPUT_DIR" 2>/dev/null)" ]; then
-            echo "❌ No device tree generated!"
+            echo "❌ No device tree generated in $OUTPUT_DIR"
+            echo "📂 Dump path contents:"
+            ls -la "$DUMP_PATH" || true
             exit 1
           fi
-          
-          # Find the generated device tree directory (usually device/brand/codename)
-          DEVICE_TREE_DIR=$(find "$OUTPUT_DIR" -type d -name "Android.bp" -o -type d -name "Android.mk" -o -type d -name "*.mk" 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo "$OUTPUT_DIR")
           
           echo "✅ Device tree generated successfully"
           echo "output_path=$OUTPUT_DIR" >> $GITHUB_OUTPUT
           
           # List generated files
           echo "📁 Generated files:"
-          find "$OUTPUT_DIR" -type f | head -30
+          find "$OUTPUT_DIR" -type f 2>/dev/null | head -50
           
           # Count files
-          FILE_COUNT=$(find "$OUTPUT_DIR" -type f | wc -l)
+          FILE_COUNT=$(find "$OUTPUT_DIR" -type f 2>/dev/null | wc -l)
           echo "📊 Total files generated: $FILE_COUNT"
 
       # ============================================================================
@@ -371,6 +406,8 @@ jobs:
           CODENAME="${{ steps.device_info.outputs.codename }}"
           
           echo "🔍 Validating device tree..."
+          echo "Brand: $BRAND"
+          echo "Codename: $CODENAME"
           
           # Create validation report
           cat > validation_report.txt << EOF
@@ -381,14 +418,14 @@ jobs:
           Workflow Run: ${{ github.run_id }}
           
           DEVICE INFO:
-          - Brand: $BRAND
-          - Codename: $CODENAME
+          - Brand: ${BRAND:-unknown}
+          - Codename: ${CODENAME:-unknown}
           - Model: ${{ steps.device_info.outputs.model }}
           - Android Version: ${{ steps.device_info.outputs.android_version }}
           - Architecture: ${{ steps.device_info.outputs.arch }}
           - Treble Enabled: ${{ steps.device_info.outputs.treble }}
           
-          GENERATED FILES:
+          GENERATED FILES CHECK:
           EOF
           
           # Check for essential files
@@ -403,30 +440,31 @@ jobs:
           )
           
           for file in "${ESSENTIAL_FILES[@]}"; do
-            if find "$OUTPUT_DIR" -name "$file" -type f | grep -q .; then
-              echo "✅ $file: Found" >> validation_report.txt
+            FOUND=$(find "$OUTPUT_DIR" -name "$file" -type f 2>/dev/null | wc -l)
+            if [ "$FOUND" -gt 0 ]; then
+              echo "✅ $file: Found ($FOUND)" >> validation_report.txt
             else
               echo "⚠️ $file: Not found" >> validation_report.txt
             fi
           done
           
           # Check for vendor blobs reference
-          if find "$OUTPUT_DIR" -name "*vendor*" -o -name "*proprietary*" | grep -q .; then
+          if find "$OUTPUT_DIR" -name "*vendor*" -o -name "*proprietary*" 2>/dev/null | grep -q .; then
             echo "✅ Vendor blobs handling: Configured" >> validation_report.txt
           fi
           
           # Generate file tree
           echo "" >> validation_report.txt
           echo "DIRECTORY STRUCTURE:" >> validation_report.txt
-          tree "$OUTPUT_DIR" >> validation_report.txt 2>/dev/null || find "$OUTPUT_DIR" -print | sed -e 's;[^/]*/;|____;g;s;____|; |;g' >> validation_report.txt
+          tree "$OUTPUT_DIR" 2>/dev/null >> validation_report.txt || find "$OUTPUT_DIR" -print 2>/dev/null | sed -e 's;[^/]*/;|____;g;s;____|; |;g' >> validation_report.txt
           
           cat validation_report.txt
-          mv validation_report.txt "$OUTPUT_DIR/"
+          cp validation_report.txt "$OUTPUT_DIR/" 2>/dev/null || true
 
       # ============================================================================
       # STEP 8: Create Release Artifacts
       # ============================================================================
-      - name: 📦 Package & Upload Artifacts
+      - name: 📦 Package & Prepare Artifacts
         run: |
           OUTPUT_DIR="${{ env.OUTPUT_DIR }}"
           BRAND="${{ steps.device_info.outputs.brand }}"
@@ -434,22 +472,32 @@ jobs:
           ANDROID_VER="${{ steps.device_info.outputs.android_version }}"
           
           # Create sanitized filename
-          SAFE_BRAND=$(echo "$BRAND" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')
-          SAFE_CODENAME=$(echo "$CODENAME" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')
+          SAFE_BRAND=$(echo "$BRAND" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-' | head -c 20)
+          SAFE_CODENAME=$(echo "$CODENAME" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-' | head -c 30)
+          
+          if [ -z "$SAFE_BRAND" ]; then SAFE_BRAND="unknown"; fi
+          if [ -z "$SAFE_CODENAME" ]; then SAFE_CODENAME="device"; fi
           
           PACKAGE_NAME="device_${SAFE_BRAND}_${SAFE_CODENAME}-android${ANDROID_VER}-dtgen"
           
           echo "📦 Creating artifact package: $PACKAGE_NAME"
           
+          # Create artifacts directory
+          mkdir -p "$WORKSPACE/artifacts"
+          
           # Create zip archive
           cd "$OUTPUT_DIR"
-          zip -r9 "$WORKSPACE/${PACKAGE_NAME}.zip" . -x "*.git*" "*.github*"
+          if command -v zip &> /dev/null; then
+            zip -r9 "$WORKSPACE/artifacts/${PACKAGE_NAME}.zip" . -x "*.git*" "*.github*" 2>/dev/null || true
+          else
+            echo "⚠️ zip not available, using tar only"
+          fi
           
-          # Create tarball for better compression
-          tar -czf "$WORKSPACE/${PACKAGE_NAME}.tar.gz" -C "$OUTPUT_DIR" .
+          # Create tarball (more reliable)
+          tar -czf "$WORKSPACE/artifacts/${PACKAGE_NAME}.tar.gz" -C "$OUTPUT_DIR" . 2>/dev/null || true
           
           # Create info file
-          cat > "$WORKSPACE/${PACKAGE_NAME}-info.txt" << EOF
+          cat > "$WORKSPACE/artifacts/${PACKAGE_NAME}-info.txt" << EOF
           Device Tree Generation Report
           =============================
           
@@ -457,12 +505,12 @@ jobs:
           Source ROM: ${{ github.event.inputs.rom_url }}
           
           Device Information:
-          - Brand: ${{ steps.device_info.outputs.brand }}
+          - Brand: ${BRAND:-unknown}
           - Manufacturer: ${{ steps.device_info.outputs.manufacturer }}
           - Device: ${{ steps.device_info.outputs.device }}
-          - Codename: ${{ steps.device_info.outputs.codename }}
+          - Codename: ${CODENAME:-unknown}
           - Model: ${{ steps.device_info.outputs.model }}
-          - Android Version: ${{ steps.device_info.outputs.android_version }}
+          - Android Version: ${ANDROID_VER:-unknown}
           - SDK Version: ${{ steps.device_info.outputs.sdk_version }}
           - Security Patch: ${{ steps.device_info.outputs.security_patch }}
           - Build Fingerprint: ${{ steps.device_info.outputs.fingerprint }}
@@ -478,14 +526,8 @@ jobs:
           Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EOF
           
-          # Move artifacts to known location
-          mkdir -p "$WORKSPACE/artifacts"
-          mv "$WORKSPACE/${PACKAGE_NAME}.zip" "$WORKSPACE/artifacts/"
-          mv "$WORKSPACE/${PACKAGE_NAME}.tar.gz" "$WORKSPACE/artifacts/"
-          mv "$WORKSPACE/${PACKAGE_NAME}-info.txt" "$WORKSPACE/artifacts/"
-          
           echo "✅ Artifacts prepared"
-          ls -lh "$WORKSPACE/artifacts/"
+          ls -lh "$WORKSPACE/artifacts/" 2>/dev/null || echo "⚠️ No artifacts created"
 
       # ============================================================================
       # STEP 9: Upload to GitHub Artifacts
@@ -496,55 +538,23 @@ jobs:
           name: device-tree-${{ steps.device_info.outputs.brand }}-${{ steps.device_info.outputs.codename }}
           path: ${{ github.workspace }}/artifacts/*
           retention-days: 30
-          compression-level: 0  # Already compressed
+          if-no-files-found: warn
 
       # ============================================================================
-      # STEP 10: Create GitHub Release (Optional - for tagged runs)
-      # ============================================================================
-      - name: 🏷️ Create Release
-        if: github.ref_type == 'tag' || contains(github.event.inputs.rom_url, 'release')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: ${{ github.workspace }}/artifacts/*
-          name: "Device Tree: ${{ steps.device_info.outputs.brand }} ${{ steps.device_info.outputs.model }} (${{ steps.device_info.outputs.codename }})"
-          body: |
-            ## 📱 Device Tree for ${{ steps.device_info.outputs.brand }} ${{ steps.device_info.outputs.model }}
-            
-            **Codename:** `${{ steps.device_info.outputs.codename }}`  
-            **Android Version:** ${{ steps.device_info.outputs.android_version }}  
-            **Architecture:** ${{ steps.device_info.outputs.arch }}
-            
-            ### 🔧 Generated Files
-            - Device configuration (BoardConfig.mk, device.mk)
-            - Vendor blob extraction scripts
-            - Proprietary files list
-            - Sepolicy configurations
-            
-            ### 📥 Source
-            - **ROM URL:** ${{ github.event.inputs.rom_url }}
-            - **Fingerprint:** `${{ steps.device_info.outputs.fingerprint }}`
-            
-            ### ⚠️ Notes
-            This device tree was automatically generated using [aospdtgen](https://github.com/sebaubuntu-python/aospdtgen).
-            Manual review and adjustments may be required for production builds.
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # ============================================================================
-      # STEP 11: Cleanup (Optional)
+      # STEP 10: Cleanup (Optional)
       # ============================================================================
       - name: 🧹 Cleanup Workspace
         if: ${{ github.event.inputs.cleanup_after == 'true' }}
         run: |
           echo "🧹 Cleaning up..."
-          rm -rf "$WORKSPACE/rom_download"
-          rm -rf "$WORKSPACE/rom_extracted"
-          rm -rf "${{ env.OUTPUT_DIR }}"
+          rm -rf "$WORKSPACE/rom_download" 2>/dev/null || true
+          rm -rf "$WORKSPACE/rom_extracted" 2>/dev/null || true
+          rm -rf "${{ env.OUTPUT_DIR }}" 2>/dev/null || true
           echo "✅ Cleanup complete"
           df -h
 
       # ============================================================================
-      # STEP 12: Summary
+      # STEP 11: Summary
       # ============================================================================
       - name: 📋 Job Summary
         run: |
