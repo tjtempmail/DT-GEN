@@ -118,26 +118,30 @@ jobs:
           mkdir -p "$DUMP_DIR"
           
           echo "🚀 Running dumpyara..."
-          dumpyara "$FIRMWARE_PATH" "$DUMP_DIR" 2>&1 | tee "${{ env.OUTPUT_DIR }}/dumpyara.log"
+          echo "Command: dumpyara -o $DUMP_DIR $FIRMWARE_PATH"
+          
+          # Use correct syntax: -o for output, then input file
+          python3 -m dumpyara -o "$DUMP_DIR" "$FIRMWARE_PATH" 2>&1 | tee "${{ env.OUTPUT_DIR }}/dumpyara.log"
           
           # Debug: Show dump directory structure
           echo "📁 Dump directory structure:"
           find "$DUMP_DIR" -maxdepth 3 -type d | head -20
           
           # Find the correct extraction path
-          # dumpyara creates subdirectories like: dump/system/ or dump/[codename]/system/
           EXTRACTED_DIR=""
           
-          # Check various possible locations
+          # Check various possible locations for system directory
           if [[ -d "$DUMP_DIR/system" ]]; then
             EXTRACTED_DIR="$DUMP_DIR"
           elif [[ -d "$DUMP_DIR/system/system" ]]; then
             EXTRACTED_DIR="$DUMP_DIR"
           else
-            # Look for system directory deeper
+            # Look for system directory deeper (dumpyara creates subdirs)
             SYS_DIR=$(find "$DUMP_DIR" -maxdepth 3 -type d -name "system" | head -1)
             if [[ -n "$SYS_DIR" ]]; then
               EXTRACTED_DIR=$(dirname "$SYS_DIR")
+              echo "Found system at: $SYS_DIR"
+              echo "Parent dir: $EXTRACTED_DIR"
             fi
           fi
           
@@ -149,6 +153,8 @@ jobs:
               # Go up to find system root
               if [[ "$BUILD_PROP_DIR" == */system ]]; then
                 EXTRACTED_DIR=$(dirname "$BUILD_PROP_DIR")
+              elif [[ "$BUILD_PROP_DIR" == */system/system ]]; then
+                EXTRACTED_DIR=$(dirname "$(dirname "$BUILD_PROP_DIR")")
               else
                 EXTRACTED_DIR="$BUILD_PROP_DIR"
               fi
@@ -166,70 +172,42 @@ jobs:
           echo "Contents:"
           ls -la "$EXTRACTED_DIR"
           
-          # Check for system partition
+          # Verify system partition exists
           if [[ ! -d "$EXTRACTED_DIR/system" ]]; then
-            echo "⚠️ Warning: No system directory found!"
+            echo "⚠️ Warning: No system directory found at $EXTRACTED_DIR/system"
+            echo "Searching for system partition..."
+            find "$EXTRACTED_DIR" -name "build.prop" -type f 2>/dev/null | head -5
           fi
           
           echo "extracted_path=$EXTRACTED_DIR" >> $GITHUB_OUTPUT
-          echo "::endgroup::"
-
-      - name: 🔧 Prepare for AOSP DT Gen
-        id: prepare
-        run: |
-          echo "::group::Preparing for aospdtgen..."
-          EXTRACTED_PATH="${{ steps.dumpyara.outputs.extracted_path }}"
-          PREPARED_DIR="${{ env.OUTPUT_DIR }}/prepared"
-          
-          mkdir -p "$PREPARED_DIR"
-          
-          # aospdtgen expects partitions as directories in the root
-          # Check if we need to reorganize
-          if [[ -d "$EXTRACTED_PATH/system" ]]; then
-            echo "✅ Partitions already in correct location"
-            PREPARED_PATH="$EXTRACTED_PATH"
-          else
-            echo "🔄 Reorganizing partition structure..."
-            # Find all partition images and mount/extract them if needed
-            # For now, symlink the found structure
-            ln -sf "$EXTRACTED_PATH" "$PREPARED_DIR/firmware"
-            PREPARED_PATH="$PREPARED_DIR/firmware"
-          fi
-          
-          # Debug: Show what aospdtgen will see
-          echo "📁 Final structure for aospdtgen:"
-          ls -la "$PREPARED_PATH"
-          if [[ -d "$PREPARED_PATH/system" ]]; then
-            echo "System partition contents:"
-            ls -la "$PREPARED_PATH/system" | head -20
-          fi
-          
-          echo "prepared_path=$PREPARED_PATH" >> $GITHUB_OUTPUT
           echo "::endgroup::"
 
       - name: 🌳 Generate AOSP Device Tree
         id: aospdtgen
         run: |
           echo "::group::Generating AOSP device tree..."
-          PREPARED_PATH="${{ steps.prepare.outputs.prepared_path }}"
+          EXTRACTED_PATH="${{ steps.dumpyara.outputs.extracted_path }}"
           DT_DIR="${{ env.OUTPUT_DIR }}/device-tree-aosp"
           
           mkdir -p "$DT_DIR"
           
           echo "🌲 Running aospdtgen..."
-          echo "Input: $PREPARED_PATH"
+          echo "Input: $EXTRACTED_PATH"
           echo "Output: $DT_DIR"
           
-          # Check if system exists
-          if [[ ! -d "$PREPARED_PATH/system" ]]; then
-            echo "❌ ERROR: system partition not found at $PREPARED_PATH/system"
+          # Verify system exists
+          if [[ ! -d "$EXTRACTED_PATH/system" ]]; then
+            echo "❌ ERROR: system partition not found at $EXTRACTED_PATH/system"
             echo "Available directories:"
-            find "$PREPARED_PATH" -maxdepth 2 -type d
+            find "$EXTRACTED_PATH" -maxdepth 2 -type d
             exit 1
           fi
           
+          echo "✅ System partition found"
+          ls -la "$EXTRACTED_PATH/system" | head -10
+          
           # Run aospdtgen
-          aospdtgen -o "$DT_DIR" "$PREPARED_PATH" 2>&1 | tee "${{ env.OUTPUT_DIR }}/aospdtgen.log"
+          aospdtgen -o "$DT_DIR" "$EXTRACTED_PATH" 2>&1 | tee "${{ env.OUTPUT_DIR }}/aospdtgen.log"
           
           FILE_COUNT=$(find "$DT_DIR" -type f 2>/dev/null | wc -l)
           echo "✅ Generated $FILE_COUNT files"
