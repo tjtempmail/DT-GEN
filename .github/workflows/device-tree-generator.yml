@@ -1,834 +1,432 @@
-name: 📱 AOSP Device Tree Generator Pro
+name: 🤖 Device Tree Generator Pro
+run-name: Generate Device Tree from ${{ inputs.rom_url }}
 
 on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: '🔗 Direct link to stock ROM (GitHub Releases, Pixeldrain, Gofile, or your server - NOT MediaFire/Google Drive)'
+        description: '📦 Direct URL to Stock ROM ZIP (OTA/Full ROM)'
         required: true
         type: string
       rom_type:
-        description: '📦 ROM Format (Auto-detect works for most)'
+        description: '📱 ROM Type'
         required: true
         type: choice
         options:
-          - 'auto-detect'
-          - 'payload.bin (A/B OTA)'
-          - 'super.img (Dynamic partitions)'
-          - 'sparse_images (system.img/vendor.img)'
-          - 'scatter_flashable (MTK/SP Flash Tool)'
-          - 'zip_flat (Extracted images in ZIP)'
-        default: 'auto-detect'
+          - 'auto'
+          - 'ota'
+          - 'fastboot'
+          - 'kdz'
+          - 'tar_md5'
+        default: 'auto'
       device_codename:
-        description: '🏷️ Device Codename (optional, auto-detected)'
+        description: '🏷️ Device Codename (optional, auto-detected if empty)'
         required: false
         type: string
-      brand:
-        description: '🏢 Brand (optional, auto-detected)'
+      manufacturer:
+        description: '🏭 Manufacturer (optional, auto-detected if empty)'
         required: false
         type: string
-      generate_proprietary:
-        description: '🔐 Generate proprietary-files.txt & extract-files.sh'
-        required: true
+      generate_twrp:
+        description: '🔄 Also Generate TWRP Device Tree'
+        required: false
         type: boolean
-        default: true
-      cleanup_after:
-        description: '🧹 Cleanup workspace after completion'
-        required: true
+        default: false
+      upload_artifacts:
+        description: '☁️ Upload Artifacts to Release'
+        required: false
         type: boolean
         default: true
 
 env:
   PYTHON_VERSION: '3.11'
   WORKSPACE: ${{ github.workspace }}
-  OUTPUT_DIR: ${{ github.workspace }}/device_tree_output
+  OUTPUT_DIR: ${{ github.workspace }}/output
 
 jobs:
-  generate-device-tree:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 180
+  extract-and-generate:
+    name: 🔧 Extract Firmware & Generate Device Tree
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     
     steps:
-      # ============================================================================
-      # STEP 1: Checkout & Setup
-      # ============================================================================
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
+      - name: 🐍 Setup Python Environment
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
 
-      - name: 🛠️ Install System Dependencies
+      - name: 🔧 Install System Dependencies
         run: |
+          echo "::group::Installing system packages..."
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            aria2 p7zip-full p7zip-rar unrar unzip zip \
-            cpio file liblz4-tool brotli simg2img img2simg \
-            android-sdk-libsparse-utils erofs-utils f2fs-tools \
-            git curl wget bc xz-utils lzma gzip \
-            libxml2-utils python3-pip e2fsprogs mount \
-            util-linux kmod
+            unace unrar zip unzip p7zip-full p7zip-rar \
+            sharutils rar uudeview mpack arj cabextract \
+            rename liblzma-dev brotli lz4 \
+            protobuf-compiler git gawk cpio \
+            erofs-utils android-sdk-libsparse-utils \
+            libxml2-utils bc curl wget aria2 \
+            python3-dev build-essential
+          echo "::endgroup::"
 
-      - name: 🔧 Install Android SDK & Python Tools
+      - name: 📦 Install Python Tools
         run: |
-          # Android SDK
-          mkdir -p $HOME/android-sdk/cmdline-tools
-          cd $HOME/android-sdk/cmdline-tools
-          curl -sS https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o cmdline-tools.zip
-          unzip -q cmdline-tools.zip && mv cmdline-tools latest
-          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platform-tools" > /dev/null 2>&1 || true
+          echo "::group::Installing Python packages..."
+          pip install --upgrade pip setuptools wheel
+          pip install \
+            dumpyara \
+            aospdtgen \
+            twrpdtgen \
+            extract-dtb \
+            pycryptodome \
+            protobuf \
+            backports.lzma \
+            requests \
+            tqdm \
+            colorama
+          echo "::endgroup::"
           
-          # Python tools - Install all dependencies first
-          python -m pip install --upgrade pip
-          pip install numpy protobuf  # Install numpy first!
-          pip install aospdtgen dumpyara pyaxmlparser
-          
-          # Install payload dumper for A/B OTA
-          git clone --depth 1 https://github.com/vm03/payload_dumper.git /tmp/payload_dumper 2>/dev/null || true
+          # Verify installations
+          echo "✅ dumpyara version: $(python3 -m dumpyara --version 2>/dev/null || echo 'installed')"
+          echo "✅ aospdtgen version: $(python3 -m aospdtgen --help | head -1 || echo 'installed')"
 
-      # ============================================================================
-      # STEP 2: Download ROM with Validation
-      # ============================================================================
-      - name: ⬇️ Download ROM
+      - name: ⬇️ Download Firmware
         id: download
         run: |
-          ROM_URL="${{ github.event.inputs.rom_url }}"
+          echo "::group::Downloading firmware from URL..."
+          mkdir -p ${{ env.OUTPUT_DIR }}
           
-          # Clean filename
-          ROM_FILENAME=$(basename "$ROM_URL" | sed 's/[?#].*$//' | sed 's/[^a-zA-Z0-9._-]/_/g')
-          [[ "$ROM_FILENAME" =~ \.(zip|tar|md5|lz4|br|img|bin|tgz)$ ]] || ROM_FILENAME="rom.zip"
+          # Create download directory
+          DOWNLOAD_DIR="${{ env.WORKSPACE }}/downloads"
+          mkdir -p "$DOWNLOAD_DIR"
           
-          echo "=========================================="
-          echo "📥 DOWNLOADING ROM"
-          echo "URL: $ROM_URL"
-          echo "Filename: $ROM_FILENAME"
-          echo "=========================================="
+          # Extract filename from URL or use default
+          FILENAME=$(basename "${{ inputs.rom_url }}" | cut -d'?' -f1 | cut -d'#' -f1)
+          if [[ -z "$FILENAME" ]] || [[ "$FILENAME" == *"="* ]]; then
+            FILENAME="firmware.zip"
+          fi
           
-          mkdir -p $WORKSPACE/rom_download
-          cd $WORKSPACE/rom_download
+          echo "📥 Downloading: $FILENAME"
+          echo "🔗 URL: ${{ inputs.rom_url }}"
           
-          # Try aria2c with multiple connections
-          echo "Attempting download with aria2c..."
-          if aria2c \
-            --max-connection-per-server=16 \
-            --split=16 \
-            --min-split-size=1M \
-            --max-tries=5 \
-            --retry-wait=30 \
-            --timeout=600 \
+          # Download with aria2c for speed and reliability
+          aria2c -x16 -s16 -j4 -c \
             --file-allocation=none \
-            --summary-interval=30 \
+            --summary-interval=10 \
             --console-log-level=warn \
-            --download-result=full \
-            --user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-            --allow-overwrite=true \
-            --auto-file-renaming=false \
-            -o "$ROM_FILENAME" \
-            "$ROM_URL" 2>&1 | tee download.log; then
-            
-            echo "✅ aria2c download completed"
-          else
-            echo "⚠️ aria2c failed, trying wget..."
-            if wget --tries=5 --timeout=600 --progress=dot:giga \
-                 --user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
-                 -O "$ROM_FILENAME" "$ROM_URL" 2>&1 | tee -a download.log; then
-              echo "✅ wget download completed"
-            else
-              echo "⚠️ wget failed, trying curl..."
-              if curl -L --max-time 600 --retry 5 \
-                   -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
-                   -o "$ROM_FILENAME" "$ROM_URL" 2>&1 | tee -a download.log; then
-                echo "✅ curl download completed"
-              else
-                echo "❌ All download methods failed!"
-                exit 1
-              fi
-            fi
-          fi
+            --download-result=hide \
+            -d "$DOWNLOAD_DIR" \
+            -o "$FILENAME" \
+            "${{ inputs.rom_url }}" || \
+          curl -L -o "$DOWNLOAD_DIR/$FILENAME" --progress-bar "${{ inputs.rom_url }}"
           
-          # Validate file exists
-          if [ ! -f "$ROM_FILENAME" ]; then
-            echo "❌ Download failed - file not found!"
+          # Verify download
+          if [[ ! -f "$DOWNLOAD_DIR/$FILENAME" ]]; then
+            echo "❌ Download failed!"
             exit 1
           fi
           
-          FILE_SIZE=$(stat -c%s "$ROM_FILENAME" 2>/dev/null || stat -f%z "$ROM_FILENAME")
-          echo ""
-          echo "📊 Download Statistics:"
-          echo "   File: $ROM_FILENAME"
-          echo "   Size: $FILE_SIZE bytes ($(numfmt --to=iec-i $FILE_SIZE))"
-          
-          # CRITICAL: Check if file is too small (HTML error page)
-          if [ "$FILE_SIZE" -lt 1000000 ]; then
-            echo ""
-            echo "🚨 CRITICAL ERROR: File is too small ($FILE_SIZE bytes)!"
-            echo "   This is likely an HTML error page, not a ROM."
-            echo ""
-            echo "📄 File content preview (first 1000 bytes):"
-            echo "----------------------------------------"
-            head -c 1000 "$ROM_FILENAME"
-            echo ""
-            echo "----------------------------------------"
-            echo ""
-            echo "❌ INVALID DOWNLOAD SOURCE"
-            echo "💡 SOLUTIONS:"
-            echo "   1. Use GitHub Releases (recommended)"
-            echo "   2. Use Pixeldrain: https://pixeldrain.com"
-            echo "   3. Use Gofile: https://gofile.io"
-            echo "   4. Use your own direct HTTP server"
-            echo "   5. DO NOT use MediaFire, Google Drive, or Mega share links"
-            exit 1
-          fi
-          
-          # Detect file type
-          FILE_TYPE=$(file -b "$ROM_FILENAME")
-          MIME_TYPE=$(file -b --mime-type "$ROM_FILENAME")
-          echo "   Type: $FILE_TYPE"
-          echo "   MIME: $MIME_TYPE"
-          
-          # Validate it's an archive or image
-          if [[ "$FILE_TYPE" == *"HTML"* ]] || [[ "$MIME_TYPE" == *"text/html"* ]]; then
-            echo "❌ ERROR: Downloaded file is HTML, not a ROM!"
-            exit 1
-          fi
-          
-          # Calculate checksums
-          echo ""
-          echo "🔐 Calculating checksums..."
-          (md5sum "$ROM_FILENAME" > "${ROM_FILENAME}.md5" && echo "   MD5: $(cut -d' ' -f1 < ${ROM_FILENAME}.md5)") &
-          (sha256sum "$ROM_FILENAME" > "${ROM_FILENAME}.sha256" && echo "   SHA256: $(cut -d' ' -f1 < ${ROM_FILENAME}.sha256)") &
-          wait
-          
-          echo ""
-          echo "rom_path=$WORKSPACE/rom_download/$ROM_FILENAME" >> $GITHUB_OUTPUT
-          echo "rom_filename=$ROM_FILENAME" >> $GITHUB_OUTPUT
-          echo "rom_size=$FILE_SIZE" >> $GITHUB_OUTPUT
-          echo "file_type=$FILE_TYPE" >> $GITHUB_OUTPUT
-          echo "✅ Download validation passed"
+          FILE_SIZE=$(du -h "$DOWNLOAD_DIR/$FILENAME" | cut -f1)
+          echo "✅ Downloaded: $FILENAME ($FILE_SIZE)"
+          echo "firmware_path=$DOWNLOAD_DIR/$FILENAME" >> $GITHUB_OUTPUT
+          echo "firmware_name=$FILENAME" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
 
-      # ============================================================================
-      # STEP 3: Smart Multi-Format Extraction
-      # ============================================================================
-      - name: 🔓 Smart Extraction (Auto-Detect Format)
-        id: extract
+      - name: 🔍 Pre-Dump Analysis
+        id: analysis
         run: |
-          ROM_PATH="${{ steps.download.outputs.rom_path }}"
-          EXTRACT_DIR="$WORKSPACE/rom_extracted"
-          WORK_DIR="$WORKSPACE/work_dir"
+          echo "::group::Analyzing firmware archive..."
+          FIRMWARE_PATH="${{ steps.download.outputs.firmware_path }}"
           
-          mkdir -p "$EXTRACT_DIR" "$WORK_DIR"
-          
-          echo ""
-          echo "=========================================="
-          echo "🔓 EXTRACTION PHASE"
-          echo "Source: $(basename "$ROM_PATH")"
-          echo "=========================================="
-          
-          cd "$WORKSPACE/rom_download"
-          
-          # Detect ROM type based on content
-          ROM_TYPE="${{ github.event.inputs.rom_type }}"
-          
-          if [[ "$ROM_TYPE" == "auto-detect" ]]; then
-            echo "🔍 Auto-detecting ROM format..."
-            
-            # Check if it's a ZIP
-            if [[ "$ROM_PATH" == *.zip ]] || file -b "$ROM_PATH" | grep -q "Zip"; then
-              echo "📦 Detected: ZIP archive"
-              
-              # Extract ZIP first
-              echo "   Extracting ZIP contents..."
-              unzip -o -q "$ROM_PATH" -d "$EXTRACT_DIR" 2>/dev/null || \
-              7z x "$ROM_PATH" -o"$EXTRACT_DIR" -y > /dev/null 2>&1 || true
-              
-              # Check what's inside
-              echo "   Analyzing contents..."
-              
-              if [ -f "$EXTRACT_DIR/payload.bin" ]; then
-                ROM_TYPE="payload"
-                echo "   ✅ Found: payload.bin (A/B OTA format)"
-              elif [ -f "$EXTRACT_DIR/super.img" ] || [ -f "$EXTRACT_DIR/Super.img" ]; then
-                ROM_TYPE="super"
-                echo "   ✅ Found: super.img (Dynamic partitions)"
-              elif ls "$EXTRACT_DIR"/*scatter*.txt 2>/dev/null | grep -q scatter; then
-                ROM_TYPE="scatter"
-                echo "   ✅ Found: scatter file (MTK/SP Flash Tool)"
-              elif ls "$EXTRACT_DIR"/*.img 2>/dev/null | grep -qE "(system|vendor|boot)"; then
-                ROM_TYPE="sparse"
-                echo "   ✅ Found: .img files (Sparse partition images)"
-              else
-                # Check nested archives
-                echo "   Checking for nested archives..."
-                find "$EXTRACT_DIR" -name "*.zip" -exec unzip -o -q {} -d "$EXTRACT_DIR" \; 2>/dev/null || true
-                find "$EXTRACT_DIR" -name "*.tar*" -exec tar -xf {} -C "$EXTRACT_DIR" \; 2>/dev/null || true
-                
-                # Re-check
-                if [ -f "$EXTRACT_DIR/payload.bin" ]; then
-                  ROM_TYPE="payload"
-                elif ls "$EXTRACT_DIR"/*.img 2>/dev/null | grep -q system; then
-                  ROM_TYPE="sparse"
-                fi
-              fi
-            elif [[ "$ROM_PATH" == *.tar* ]] || file -b "$ROM_PATH" | grep -q "tar"; then
-              echo "📦 Detected: TAR archive"
-              tar -xf "$ROM_PATH" -C "$EXTRACT_DIR" 2>/dev/null || true
-              ROM_TYPE="sparse"
-            else
-              echo "📦 Treating as raw image"
-              cp "$ROM_PATH" "$EXTRACT_DIR/"
-              ROM_TYPE="sparse"
-            fi
+          # Detect archive type and contents
+          echo "📦 Archive contents:"
+          if command -v 7z &> /dev/null; then
+            7z l "$FIRMWARE_PATH" | head -50 || unzip -l "$FIRMWARE_PATH" | head -50
           else
-            # User specified type
-            echo "📦 User specified type: $ROM_TYPE"
-            if [[ "$ROM_PATH" == *.zip ]]; then
-              unzip -o -q "$ROM_PATH" -d "$EXTRACT_DIR" 2>/dev/null || true
-            fi
+            unzip -l "$FIRMWARE_PATH" | head -50
           fi
           
-          echo ""
-          echo "🔧 Processing ROM type: $ROM_TYPE"
-          echo "----------------------------------------"
-          
-          # Process based on ROM type
-          case "$ROM_TYPE" in
-            payload*)
-              echo "🔧 Extracting payload.bin..."
-              if [ -f "$EXTRACT_DIR/payload.bin" ]; then
-                cd /tmp/payload_dumper
-                python3 payload_dumper.py "$EXTRACT_DIR/payload.bin" --out "$WORK_DIR" 2>&1 | head -50 || {
-                  echo "⚠️ payload_dumper failed, trying alternative..."
-                  # Manual extraction with ota_extractor if available
-                  if command -v ota_extractor &> /dev/null; then
-                    ota_extractor --payload "$EXTRACT_DIR/payload.bin" --output_dir "$WORK_DIR" 2>/dev/null || true
-                  fi
-                }
-                cd "$WORKSPACE"
-              fi
-              ;;
-              
-            super*)
-              echo "🔧 Extracting super.img (Dynamic partitions)..."
-              SUPER_IMG=$(ls "$EXTRACT_DIR"/[Ss]uper.img 2>/dev/null | head -1)
-              if [ -n "$SUPER_IMG" ]; then
-                echo "   Found: $SUPER_IMG"
-                
-                # Convert sparse super.img to raw first
-                echo "   Converting sparse super.img to raw..."
-                simg2img "$SUPER_IMG" "$WORK_DIR/super.raw.img" 2>/dev/null || {
-                  echo "⚠️ simg2img failed, trying to copy as-is..."
-                  cp "$SUPER_IMG" "$WORK_DIR/super.raw.img" 2>/dev/null || true
-                }
-                
-                # Check if we got a raw image
-                if [ -f "$WORK_DIR/super.raw.img" ]; then
-                  echo "   ✅ Raw super image created"
-                  
-                  # Try to use lpunpack if available
-                  if command -v lpunpack &> /dev/null; then
-                    echo "   Using lpunpack to extract partitions..."
-                    cd "$WORK_DIR"
-                    lpunpack super.raw.img . 2>&1 | head -30 || {
-                      echo "⚠️ lpunpack failed, trying manual extraction..."
-                    }
-                    cd "$WORKSPACE"
-                  fi
-                  
-                  # Try unsuper as alternative
-                  if command -v unsuper &> /dev/null; then
-                    echo "   Trying unsuper..."
-                    cd "$WORK_DIR"
-                    unsuper super.raw.img . 2>&1 | head -30 || {
-                      echo "⚠️ unsuper failed (this is OK if lpunpack worked)"
-                    }
-                    cd "$WORKSPACE"
-                  fi
-                  
-                  # Check if we extracted anything
-                  if ls "$WORK_DIR"/*.img 2>/dev/null | grep -q .; then
-                    echo "   ✅ Partitions extracted from super.img"
-                  else
-                    echo "   ⚠️ No partitions extracted, will try to mount super.img directly"
-                  fi
-                else
-                  echo "   ❌ Failed to create raw super image"
-                fi
-              else
-                echo "   ❌ super.img not found!"
-              fi
-              ;;
-              
-            scatter*)
-              echo "🔧 Processing MTK Scatter ROM..."
-              SCATTER=$(ls "$EXTRACT_DIR"/*scatter*.txt 2>/dev/null | head -1)
-              echo "   Scatter file: $(basename "$SCATTER")"
-              
-              # Handle sparse chunks for system
-              if ls "$EXTRACT_DIR"/system_sparse_chunk* 2>/dev/null | grep -q .; then
-                echo "   📦 Combining system sparse chunks..."
-                cat "$EXTRACT_DIR"/system_sparse_chunk* > "$WORK_DIR/system.img" 2>/dev/null || true
-              elif [ -f "$EXTRACT_DIR/system.img" ]; then
-                cp "$EXTRACT_DIR/system.img" "$WORK_DIR/" 2>/dev/null || true
-              fi
-              
-              # Handle vendor chunks
-              if ls "$EXTRACT_DIR"/vendor_sparse_chunk* 2>/dev/null | grep -q .; then
-                echo "   📦 Combining vendor sparse chunks..."
-                cat "$EXTRACT_DIR"/vendor_sparse_chunk* > "$WORK_DIR/vendor.img" 2>/dev/null || true
-              elif [ -f "$EXTRACT_DIR/vendor.img" ]; then
-                cp "$EXTRACT_DIR/vendor.img" "$WORK_DIR/" 2>/dev/null || true
-              fi
-              
-              # Copy other important images
-              for img in boot.img dtbo.img vbmeta.img recovery.img; do
-                [ -f "$EXTRACT_DIR/$img" ] && cp "$EXTRACT_DIR/$img" "$WORK_DIR/" 2>/dev/null || true
-              done
-              ;;
-              
-            sparse*|*flat*)
-              echo "🔧 Processing sparse images..."
-              # Copy all img files to work dir
-              find "$EXTRACT_DIR" -name "*.img" -type f -exec cp {} "$WORK_DIR/" \; 2>/dev/null || true
-              ;;
-          esac
-          
-          echo ""
-          echo "🔄 Converting sparse images to raw..."
-          cd "$WORK_DIR"
-          
-          # List what we have before conversion
-          echo "   Files in work_dir before conversion:"
-          ls -lh *.img 2>/dev/null | head -20 || echo "   (No .img files found)"
-          
-          # Convert all sparse images
-          for img in *.img; do
-            if [ -f "$img" ]; then
-              # Check if it's a sparse image
-              if file "$img" | grep -q "sparse"; then
-                echo "   Converting sparse: $img"
-                simg2img "$img" "${img%.img}.raw.img" 2>/dev/null && {
-                  rm -f "$img"
-                  echo "     ✅ Converted to ${img%.img}.raw.img"
-                } || {
-                  echo "     ⚠️ simg2img failed for $img"
-                  # Try to rename anyway in case it's already raw
-                  mv "$img" "${img%.img}.raw.img" 2>/dev/null || true
-                }
-              else
-                # Not sparse, just rename
-                echo "   Renaming to raw: $img"
-                mv "$img" "${img%.img}.raw.img" 2>/dev/null || true
-              fi
-            fi
-          done
-          
-          echo ""
-          echo "📂 Files after conversion:"
-          ls -lh *.raw.img 2>/dev/null | head -20 || echo "   (No raw images found)"
-          
-          # Mount raw images to extract contents
-          echo ""
-          echo "📂 Mounting partitions to extract contents..."
-          mkdir -p "$WORKSPACE/mounted_partitions"
-          
-          # Mount each raw image and copy contents
-          for raw_img in *.raw.img; do
-            if [ -f "$raw_img" ]; then
-              part_name=$(basename "$raw_img" .raw.img)
-              mount_point="$WORKSPACE/mounted_partitions/$part_name"
-              
-              echo "   Mounting: $part_name"
-              mkdir -p "$mount_point"
-              
-              # Try ext4 first, then auto
-              if sudo mount -o loop,ro -t ext4 "$raw_img" "$mount_point" 2>/dev/null; then
-                echo "     ✅ Mounted as ext4"
-              elif sudo mount -o loop,ro -t auto "$raw_img" "$mount_point" 2>/dev/null; then
-                echo "     ✅ Mounted (auto)"
-              else
-                echo "     ⚠️ Could not mount (skipping)"
-                rmdir "$mount_point" 2>/dev/null || true
-                continue
-              fi
-              
-              # Copy mounted contents to a clean directory
-              dest_dir="$WORKSPACE/dump/$part_name"
-              mkdir -p "$dest_dir"
-              echo "     📦 Copying contents to $dest_dir"
-              sudo cp -a "$mount_point/." "$dest_dir/" 2>/dev/null || true
-              sudo umount "$mount_point" 2>/dev/null || true
-            fi
-          done
-          
-          # Also try to mount super.raw.img directly if it exists and we haven't extracted partitions
-          if [ -f "$WORK_DIR/super.raw.img" ] && [ ! -d "$WORKSPACE/dump/system" ]; then
-            echo ""
-            echo "🔧 Attempting to mount super.raw.img directly..."
-            mount_point="$WORKSPACE/mounted_partitions/super"
-            mkdir -p "$mount_point"
-            
-            # Try to mount super partition
-            if sudo mount -o loop,ro -t auto "$WORK_DIR/super.raw.img" "$mount_point" 2>/dev/null; then
-              echo "   ✅ Mounted super partition"
-              # Look for logical partitions inside
-              for subpart in system vendor product system_ext odm; do
-                if [ -d "$mount_point/$subpart" ]; then
-                  echo "   📦 Found logical partition: $subpart"
-                  mkdir -p "$WORKSPACE/dump/$subpart"
-                  sudo cp -a "$mount_point/$subpart/." "$WORKSPACE/dump/$subpart/" 2>/dev/null || true
-                fi
-              done
-              sudo umount "$mount_point" 2>/dev/null || true
-            else
-              echo "   ⚠️ Could not mount super partition directly"
-              rmdir "$mount_point" 2>/dev/null || true
-            fi
-          fi
-          
-          # Determine final dump path
-          echo ""
-          echo "🔍 Locating system partition..."
-          
-          if [ -d "$WORKSPACE/dump/system" ]; then
-            DUMP_PATH="$WORKSPACE/dump"
-            echo "   ✅ Found: $DUMP_PATH/system"
-          elif [ -d "$WORKSPACE/dump/system_ext" ]; then
-            DUMP_PATH="$WORKSPACE/dump"
-            echo "   ✅ Found: $DUMP_PATH/system_ext"
+          # Check for specific patterns
+          if unzip -l "$FIRMWARE_PATH" 2>/dev/null | grep -q "payload.bin"; then
+            echo "📋 Detected: A/B OTA (payload.bin)"
+            echo "rom_format=ab_ota" >> $GITHUB_OUTPUT
+          elif unzip -l "$FIRMWARE_PATH" 2>/dev/null | grep -q "super.img"; then
+            echo "📋 Detected: Dynamic partitions (super.img)"
+            echo "rom_format=dynamic" >> $GITHUB_OUTPUT
+          elif unzip -l "$FIRMWARE_PATH" 2>/dev/null | grep -q ".tar.md5"; then
+            echo "📋 Detected: Samsung tar.md5"
+            echo "rom_format=tar_md5" >> $GITHUB_OUTPUT
           else
-            # Search for build.prop
-            BUILD_PROP=$(find "$WORKSPACE/dump" -name "build.prop" -type f 2>/dev/null | head -1)
-            if [ -n "$BUILD_PROP" ]; then
-              SYS_DIR=$(dirname "$BUILD_PROP")
-              DUMP_PATH=$(dirname "$SYS_DIR")
-              echo "   ✅ Found system at: $SYS_DIR"
-            else
-              echo "   ❌ No system partition found!"
-              echo ""
-              echo "📂 Dump directory contents:"
-              find "$WORKSPACE/dump" -type f -o -type d 2>/dev/null | head -30 || echo "   (Empty or not found)"
-              echo ""
-              echo "📂 Work directory contents:"
-              ls -la "$WORK_DIR" 2>/dev/null || echo "   (Empty or not found)"
-              echo ""
-              echo "📂 Mounted partitions:"
-              ls -la "$WORKSPACE/mounted_partitions/" 2>/dev/null || echo "   (None)"
-              exit 1
-            fi
+            echo "rom_format=standard" >> $GITHUB_OUTPUT
           fi
-          
-          echo ""
-          echo "=========================================="
-          echo "✅ EXTRACTION COMPLETE"
-          echo "Dump path: $DUMP_PATH"
-          echo "=========================================="
-          
-          # List structure
-          echo "📁 Final structure:"
-          find "$DUMP_PATH" -maxdepth 2 -type d 2>/dev/null | head -20 || true
-          
-          echo "dump_path=$DUMP_PATH" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
 
-      # ============================================================================
-      # STEP 4: Generate Device Tree with aospdtgen
-      # ============================================================================
-      - name: 🌳 Generate Device Tree
-        id: generate
+      - name: 🗂️ Extract Firmware with Dumpyara
+        id: dumpyara
         run: |
-          DUMP_PATH="${{ steps.extract.outputs.dump_path }}"
-          OUTPUT_DIR="${{ env.OUTPUT_DIR }}"
+          echo "::group::Running dumpyara extraction..."
+          FIRMWARE_PATH="${{ steps.download.outputs.firmware_path }}"
+          DUMP_DIR="${{ env.OUTPUT_DIR }}/dump"
           
-          echo ""
-          echo "=========================================="
-          echo "🌳 GENERATING DEVICE TREE"
-          echo "=========================================="
+          mkdir -p "$DUMP_DIR"
           
-          # Pre-check
-          if [ ! -d "$DUMP_PATH" ]; then
-            echo "❌ ERROR: Dump path does not exist: $DUMP_PATH"
+          echo "🚀 Starting dumpyara extraction..."
+          echo "   Source: $FIRMWARE_PATH"
+          echo "   Output: $DUMP_DIR"
+          
+          # Run dumpyara with verbose output
+          python3 -m dumpyara "$FIRMWARE_PATH" -o "$DUMP_DIR" 2>&1 | tee "${{ env.OUTPUT_DIR }}/dumpyara.log"
+          
+          if [[ $? -ne 0 ]]; then
+            echo "❌ Dumpyara extraction failed!"
+            cat "${{ env.OUTPUT_DIR }}/dumpyara.log"
             exit 1
           fi
           
-          # Critical: Verify system partition exists (required by aospdtgen)
-          echo "🔍 Verifying system partition..."
-          SYS_FOUND=false
+          # Find the extracted dump directory (dumpyara creates subfolder)
+          EXTRACTED_DIR=$(find "$DUMP_DIR" -maxdepth 2 -type d -name "system" -o -name "vendor" | head -1 | xargs dirname 2>/dev/null || echo "$DUMP_DIR")
           
-          if [ -d "$DUMP_PATH/system" ]; then
-            echo "   ✅ system/ directory exists"
-            SYS_FOUND=true
+          # List extracted contents
+          echo "📁 Extracted contents:"
+          ls -la "$EXTRACTED_DIR" || ls -la "$DUMP_DIR"
+          
+          # Detect device info from build.prop if available
+          if [[ -f "$EXTRACTED_DIR/system/build.prop" ]]; then
+            echo "🔍 Reading device info from build.prop..."
+            cat "$EXTRACTED_DIR/system/build.prop" | grep -E "ro.product.(device|brand|manufacturer|model|name)" | head -10 || true
           fi
           
-          if [ -d "$DUMP_PATH/system_ext" ]; then
-            echo "   ✅ system_ext/ directory exists"
-            SYS_FOUND=true
-          fi
-          
-          if [ "$SYS_FOUND" != "true" ]; then
-            echo ""
-            echo "❌ CRITICAL ERROR: No system or system_ext partition found!"
-            echo ""
-            echo "💡 This usually means:"
-            echo "   1. The ROM download was incomplete/invalid"
-            echo "   2. The extraction failed to mount sparse images"
-            echo "   3. This is a custom ROM format not supported"
-            echo ""
-            echo "📂 Dump directory contents:"
-            ls -la "$DUMP_PATH" || true
-            echo ""
-            echo "📂 All directories:"
-            find "$DUMP_PATH" -type d 2>/dev/null | head -30 || true
-            exit 1
-          fi
-          
-          # Check for build.prop
-          if [ ! -f "$DUMP_PATH/system/build.prop" ] && [ ! -f "$DUMP_PATH/system_ext/build.prop" ]; then
-            echo "⚠️ WARNING: build.prop not found in system directories"
-          fi
-          
-          mkdir -p "$OUTPUT_DIR"
-          
-          echo ""
-          echo "⚙️ Running aospdtgen..."
-          echo "   Input:  $DUMP_PATH"
-          echo "   Output: $OUTPUT_DIR"
-          
-          # Build arguments
-          AOSP_ARGS="-o \"$OUTPUT_DIR\""
-          [[ "${{ github.event.inputs.generate_proprietary }}" == "false" ]] && AOSP_ARGS="$AOSP_ARGS --no-proprietary-files"
-          
-          echo "   Args: $AOSP_ARGS"
-          echo ""
-          
-          # Run with timeout and capture output
-          if timeout 600 bash -c "python3 -m aospdtgen $AOSP_ARGS \"$DUMP_PATH\"" 2>&1 | tee aospdtgen.log; then
-            echo ""
-            echo "✅ aospdtgen completed successfully"
-          else
-            EXIT_CODE=$?
-            echo ""
-            echo "⚠️ aospdtgen exited with code $EXIT_CODE"
-            echo "📄 Last 50 lines of log:"
-            tail -50 aospdtgen.log 2>/dev/null || true
-          fi
-          
-          # Verify output was created
-          if [ ! -d "$OUTPUT_DIR" ] || [ -z "$(ls -A "$OUTPUT_DIR" 2>/dev/null)" ]; then
-            echo ""
-            echo "❌ ERROR: No device tree was generated!"
-            echo "   The output directory is empty."
-            echo ""
-            echo "💡 Possible causes:"
-            echo "   1. aospdtgen couldn't find required partitions"
-            echo "   2. The ROM structure is unsupported"
-            echo "   3. Missing proprietary files detection"
-            exit 1
-          fi
-          
-          # Success
-          FILE_COUNT=$(find "$OUTPUT_DIR" -type f 2>/dev/null | wc -l)
-          echo ""
-          echo "=========================================="
-          echo "✅ DEVICE TREE GENERATED"
-          echo "Files created: $FILE_COUNT"
-          echo "=========================================="
-          
-          echo ""
-          echo "📁 Generated files:"
-          find "$OUTPUT_DIR" -type f 2>/dev/null | sort | head -40 || true
-          
-          echo "output_path=$OUTPUT_DIR" >> $GITHUB_OUTPUT
-          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+          echo "extracted_path=$EXTRACTED_DIR" >> $GITHUB_OUTPUT
+          echo "✅ Extraction complete!"
+          echo "::endgroup::"
 
-      # ============================================================================
-      # STEP 5: Post-Processing & Validation
-      # ============================================================================
-      - name: ✅ Validate & Create Report
-        id: validate
+      - name: 🌳 Generate AOSP Device Tree
+        id: aospdtgen
         run: |
-          OUTPUT_DIR="${{ env.OUTPUT_DIR }}"
+          echo "::group::Generating AOSP device tree..."
+          EXTRACTED_PATH="${{ steps.dumpyara.outputs.extracted_path }}"
+          DT_DIR="${{ env.OUTPUT_DIR }}/device-tree-aosp"
           
-          echo ""
-          echo "🔍 Validating device tree..."
+          mkdir -p "$DT_DIR"
           
-          # Create validation report
-          REPORT="$OUTPUT_DIR/DEVICE_TREE_REPORT.txt"
+          echo "🌲 Running aospdtgen..."
+          echo "   Input: $EXTRACTED_PATH"
+          echo "   Output: $DT_DIR"
           
-          cat > "$REPORT" << EOF
-          ============================================
-          AOSP DEVICE TREE GENERATION REPORT
-          ============================================
+          # Run aospdtgen
+          python3 -m aospdtgen -o "$DT_DIR" "$EXTRACTED_PATH" 2>&1 | tee "${{ env.OUTPUT_DIR }}/aospdtgen.log"
+          
+          GEN_STATUS=$?
+          
+          # Find generated tree
+          GENERATED_TREE=$(find "$DT_DIR" -type d -name "Android.bp" -o -name "Android.mk" | head -1 | xargs dirname 2>/dev/null || echo "$DT_DIR")
+          
+          echo "📁 Generated AOSP device tree contents:"
+          find "$DT_DIR" -type f | head -30 || ls -laR "$DT_DIR"
+          
+          # Create metadata
+          cat > "${{ env.OUTPUT_DIR }}/aospdtgen-info.txt" << EOF
+          AOSP Device Tree Generation Report
+          =================================
           Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          Workflow Run: ${{ github.run_id }}
-          Repository: ${{ github.repository }}
+          Source ROM: ${{ inputs.rom_url }}
+          Extraction Path: $EXTRACTED_PATH
           
-          SOURCE ROM:
-          - URL: ${{ github.event.inputs.rom_url }}
-          - Type: ${{ github.event.inputs.rom_type }}
+          Files Generated:
+          $(find "$DT_DIR" -type f | wc -l) total files
           
-          ESSENTIAL FILES CHECK:
+          Directory Structure:
+          $(tree -L 3 "$DT_DIR" 2>/dev/null || find "$DT_DIR" -maxdepth 3 -type d)
           EOF
           
-          ESSENTIAL=(
-            "Android.bp:Build system file"
-            "Android.mk:Legacy build file"
-            "BoardConfig.mk:Board configuration"
-            "device.mk:Device makefile"
-            "extract-files.sh:Vendor extraction script"
-            "setup-makefiles.sh:Makefile setup"
-            "proprietary-files.txt:Proprietary blobs list"
-          )
-          
-          FOUND_COUNT=0
-          for item in "${ESSENTIAL[@]}"; do
-            IFS=':' read -r file desc <<< "$item"
-            count=$(find "$OUTPUT_DIR" -name "$file" -type f 2>/dev/null | wc -l)
-            if [ "$count" -gt 0 ]; then
-              echo "✅ $file: Found ($count) - $desc" >> "$REPORT"
-              ((FOUND_COUNT++))
-            else
-              echo "⚠️ $file: NOT FOUND - $desc" >> "$REPORT"
-            fi
-          done
-          
-          echo "" >> "$REPORT"
-          echo "VALIDATION SCORE: $FOUND_COUNT/${#ESSENTIAL[@]} essential files" >> "$REPORT"
-          echo "" >> "$REPORT"
-          echo "DIRECTORY STRUCTURE:" >> "$REPORT"
-          tree "$OUTPUT_DIR" 2>/dev/null >> "$REPORT" || \
-          find "$OUTPUT_DIR" -print 2>/dev/null | sed -e 's;[^/]*/;|____;g;s;____|; |;g' >> "$REPORT"
-          
-          cat "$REPORT"
-          
-          echo "validation_score=$FOUND_COUNT" >> $GITHUB_OUTPUT
+          echo "aosp_dt_path=$DT_DIR" >> $GITHUB_OUTPUT
+          echo "aosp_status=$GEN_STATUS" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
 
-      # ============================================================================
-      # STEP 6: Package Artifacts
-      # ============================================================================
-      - name: 📦 Package Artifacts
+      - name: 🔄 Generate TWRP Device Tree (Optional)
+        if: inputs.generate_twrp == true
+        id: twrpdtgen
         run: |
-          OUTPUT_DIR="${{ env.OUTPUT_DIR }}"
-          mkdir -p "$WORKSPACE/artifacts"
+          echo "::group::Generating TWRP device tree..."
+          EXTRACTED_PATH="${{ steps.dumpyara.outputs.extracted_path }}"
+          TWRP_DIR="${{ env.OUTPUT_DIR }}/device-tree-twrp"
           
-          # Get device info for naming
-          BRAND="${{ github.event.inputs.brand }}"
-          CODENAME="${{ github.event.inputs.device_codename }}"
+          mkdir -p "$TWRP_DIR"
           
-          # Try to extract from device tree if not provided
-          if [ -z "$BRAND" ] && [ -f "$OUTPUT_DIR/AndroidProducts.mk" ]; then
-            BRAND=$(grep -oP 'LOCAL_DIR.*device/\K[^/]+' "$OUTPUT_DIR/AndroidProducts.mk" 2>/dev/null | head -1)
+          # Look for recovery.img or boot.img
+          RECOVERY_IMG=$(find "$EXTRACTED_PATH" -maxdepth 2 -name "recovery.img" -o -name "recovery.img.lz4" | head -1)
+          BOOT_IMG=$(find "$EXTRACTED_PATH" -maxdepth 2 -name "boot.img" -o -name "boot.img.lz4" | head -1)
+          
+          TARGET_IMG=""
+          if [[ -n "$RECOVERY_IMG" ]]; then
+            echo "🩹 Found recovery image: $RECOVERY_IMG"
+            TARGET_IMG="$RECOVERY_IMG"
+          elif [[ -n "$BOOT_IMG" ]]; then
+            echo "👢 Using boot image (no recovery found): $BOOT_IMG"
+            TARGET_IMG="$BOOT_IMG"
+          else
+            echo "⚠️ No recovery/boot image found for TWRP generation"
+            echo "twrp_status=skipped" >> $GITHUB_OUTPUT
+            echo "::endgroup::"
+            exit 0
           fi
-          if [ -z "$CODENAME" ] && [ -f "$OUTPUT_DIR/AndroidProducts.mk" ]; then
-            CODENAME=$(grep -oP 'LOCAL_DIR.*device/[^/]+/\K[^[:space:]]+' "$OUTPUT_DIR/AndroidProducts.mk" 2>/dev/null | head -1)
-          fi
           
-          # Fallbacks
-          [ -z "$BRAND" ] && BRAND="unknown"
-          [ -z "$CODENAME" ] && CODENAME="device"
+          echo "🔄 Running twrpdtgen on $TARGET_IMG..."
+          python3 -m twrpdtgen -o "$TWRP_DIR" "$TARGET_IMG" 2>&1 | tee "${{ env.OUTPUT_DIR }}/twrpdtgen.log" || true
           
-          SAFE_BRAND=$(echo "$BRAND" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-' | cut -c1-15)
-          SAFE_CODENAME=$(echo "$CODENAME" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-' | cut -c1-20)
+          echo "📁 TWRP device tree contents:"
+          find "$TWRP_DIR" -type f 2>/dev/null | head -20 || echo "No TWRP files generated"
           
-          PKG_NAME="device_${SAFE_BRAND}_${SAFE_CODENAME}_dtgen"
+          echo "twrp_dt_path=$TWRP_DIR" >> $GITHUB_OUTPUT
+          echo "twrp_status=completed" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+
+      - name: 📊 Post-Processing & Validation
+        run: |
+          echo "::group::Post-processing and validation..."
           
-          echo ""
-          echo "📦 Packaging: $PKG_NAME"
+          # Create comprehensive report
+          REPORT_FILE="${{ env.OUTPUT_DIR }}/GENERATION_REPORT.md"
           
-          cd "$OUTPUT_DIR"
+          cat > "$REPORT_FILE" << EOF
+          # Device Tree Generation Report
           
-          # Create ZIP
-          zip -r9 "$WORKSPACE/artifacts/${PKG_NAME}.zip" . -x "*.git*" 2>/dev/null || \
-          (echo "⚠️ zip failed, using tar only" && false)
+          ## 📋 Job Information
+          - **Workflow Run**: ${{ github.run_id }}
+          - **Triggered by**: @${{ github.actor }}
+          - **Timestamp**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
           
-          # Create TAR.GZ (more reliable)
-          tar -czf "$WORKSPACE/artifacts/${PKG_NAME}.tar.gz" .
+          ## 📥 Input Parameters
+          - **ROM URL**: ${{ inputs.rom_url }}
+          - **ROM Type**: ${{ inputs.rom_type }}
+          - **Device Codename**: ${{ inputs.device_codename || 'Auto-detected' }}
+          - **Manufacturer**: ${{ inputs.manufacturer || 'Auto-detected' }}
+          - **Generate TWRP**: ${{ inputs.generate_twrp }}
           
-          # Create info file
-          cat > "$WORKSPACE/artifacts/${PKG_NAME}_INFO.txt" << EOF
-          Device Tree Package
-          ===================
-          Brand:    $BRAND
-          Codename: $CODENAME
-          Package:  $PKG_NAME
-          Date:     $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          Source:   ${{ github.event.inputs.rom_url }}
+          ## 🔧 Extraction Results
+          - **Firmware File**: ${{ steps.download.outputs.firmware_name }}
+          - **ROM Format**: ${{ steps.analysis.outputs.rom_format }}
+          - **Extracted Path**: ${{ steps.dumpyara.outputs.extracted_path }}
           
-          Files:    $(find "$OUTPUT_DIR" -type f | wc -l)
+          ## 🌳 AOSP Device Tree
+          - **Status**: $([ ${{ steps.aospdtgen.outputs.aosp_status }} -eq 0 ] && echo "✅ Success" || echo "⚠️ Completed with warnings")
+          - **Location**: \`${{ steps.aospdtgen.outputs.aosp_dt_path }}\`
+          - **Files**: $(find ${{ steps.aospdtgen.outputs.aosp_dt_path }} -type f 2>/dev/null | wc -l)
           
-          Generated by GitHub Actions
-          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EOF
           
-          echo ""
-          echo "✅ Artifacts created:"
-          ls -lh "$WORKSPACE/artifacts/"
+          if [[ "${{ inputs.generate_twrp }}" == "true" ]]; then
+          cat >> "$REPORT_FILE" << EOF
+          ## 🔄 TWRP Device Tree
+          - **Status**: ${{ steps.twrpdtgen.outputs.twrp_status }}
+          - **Location**: \`${{ steps.twrpdtgen.outputs.twrp_dt_path }}\`
+          
+          EOF
+          fi
+          
+          cat >> "$REPORT_FILE" << EOF
+          
+          ## 📁 Output Structure
+          \`\`\`
+          $(tree -L 2 ${{ env.OUTPUT_DIR }} 2>/dev/null || find ${{ env.OUTPUT_DIR }} -maxdepth 2 -type d | sed 's|${{ env.OUTPUT_DIR }}|output|')
+          \`\`\`
+          
+          ## 📝 Logs
+          - Dumpyara log: \`dumpyara.log\`
+          - AOSP DT Gen log: \`aospdtgen.log\`
+          $([[ "${{ inputs.generate_twrp }}" == "true" ]] && echo "- TWRP DT Gen log: \`twrpdtgen.log\`")
+          
+          ---
+          *Generated by Device Tree Generator Pro*
+          EOF
+          
+          echo "📄 Report generated: $REPORT_FILE"
+          cat "$REPORT_FILE"
+          echo "::endgroup::"
 
-      # ============================================================================
-      # STEP 7: Upload to GitHub
-      # ============================================================================
+      - name: 📦 Package Outputs
+        run: |
+          echo "::group::Packaging outputs..."
+          cd ${{ env.OUTPUT_DIR }}
+          
+          # Create structured archives
+          if [[ -d "device-tree-aosp" ]]; then
+            tar -czf aosp-device-tree.tar.gz device-tree-aosp/
+            echo "✅ Created aosp-device-tree.tar.gz ($(du -h aosp-device-tree.tar.gz | cut -f1))"
+          fi
+          
+          if [[ -d "device-tree-twrp" ]] && [[ "$(ls -A device-tree-twrp 2>/dev/null)" ]]; then
+            tar -czf twrp-device-tree.tar.gz device-tree-twrp/
+            echo "✅ Created twrp-device-tree.tar.gz ($(du -h twrp-device-tree.tar.gz | cut -f1))"
+          fi
+          
+          # Create full dump archive (optional, might be large)
+          if [[ -d "dump" ]]; then
+            echo "📦 Dump directory size: $(du -sh dump/ | cut -f1)"
+            # Only archive if under 1GB
+            DUMP_SIZE=$(du -sm dump/ | cut -f1)
+            if [[ $DUMP_SIZE -lt 1024 ]]; then
+              tar -czf firmware-dump.tar.gz dump/
+              echo "✅ Created firmware-dump.tar.gz"
+            else
+              echo "⚠️ Dump too large to archive ($DUMP_SIZE MB), skipping"
+            fi
+          fi
+          
+          # List final artifacts
+          echo "📦 Final artifacts:"
+          ls -lh *.tar.gz *.md *.txt 2>/dev/null || ls -lh
+          echo "::endgroup::"
+
       - name: ☁️ Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: device-tree-${{ github.run_id }}
-          path: ${{ github.workspace }}/artifacts/*
+          path: |
+            ${{ env.OUTPUT_DIR }}/*.tar.gz
+            ${{ env.OUTPUT_DIR }}/*.md
+            ${{ env.OUTPUT_DIR }}/*.txt
+            ${{ env.OUTPUT_DIR }}/*.log
           retention-days: 30
-          if-no-files-found: error
+          compression-level: 6
 
-      # ============================================================================
-      # STEP 8: Cleanup
-      # ============================================================================
-      - name: 🧹 Cleanup
-        if: ${{ github.event.inputs.cleanup_after == 'true' && always() }}
-        run: |
-          echo "Cleaning up..."
-          sudo umount "$WORKSPACE/mounted_partitions/"* 2>/dev/null || true
-          rm -rf "$WORKSPACE/rom_download" "$WORKSPACE/rom_extracted" \
-                 "$WORKSPACE/work_dir" "$WORKSPACE/mounted_partitions" \
-                 "$WORKSPACE/dump" "${{ env.OUTPUT_DIR }}"
-          echo "✅ Cleanup complete"
-          df -h
+      - name: 🚀 Create Release (Optional)
+        if: inputs.upload_artifacts == true && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: dt-gen-${{ github.run_number }}-${{ github.run_id }}
+          name: "Device Tree Build ${{ github.run_number }}"
+          body_path: ${{ env.OUTPUT_DIR }}/GENERATION_REPORT.md
+          files: |
+            ${{ env.OUTPUT_DIR }}/*.tar.gz
+          draft: true
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ============================================================================
-      # STEP 9: Final Summary
-      # ============================================================================
-      - name: 📋 Final Summary
+      - name: 📝 Job Summary
         if: always()
         run: |
-          echo "## 📱 Device Tree Generation Report" >> $GITHUB_STEP_SUMMARY
+          echo "## 🤖 Device Tree Generation Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "${{ job.status }}" == "success" ]; then
-            echo "🟢 **STATUS: SUCCESS**" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "🔴 **STATUS: FAILED**" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 📥 Download | ${{ steps.download.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔍 Analysis | ${{ steps.analysis.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🗂️ Extraction | ${{ steps.dumpyara.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌳 AOSP DT Gen | ${{ steps.aospdtgen.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ inputs.generate_twrp }}" == "true" ]]; then
+            echo "| 🔄 TWRP DT Gen | ${{ steps.twrpdtgen.outcome }} |" >> $GITHUB_STEP_SUMMARY
           fi
-          
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **ROM URL** | ${{ github.event.inputs.rom_url }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **ROM Type** | ${{ github.event.inputs.rom_type }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Brand** | ${{ github.event.inputs.brand }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Codename** | ${{ github.event.inputs.device_codename }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "${{ job.status }}" == "success" ]; then
-            echo "### ✅ Generated Files" >> $GITHUB_STEP_SUMMARY
-            echo "- Device Tree ZIP" >> $GITHUB_STEP_SUMMARY
-            echo "- Device Tree TAR.GZ" >> $GITHUB_STEP_SUMMARY
-            echo "- Validation Report" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "📥 [Download Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
-            echo "Check the logs above for specific error messages." >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "💡 **Common fixes:**" >> $GITHUB_STEP_SUMMARY
-            echo "1. Use GitHub Releases instead of MediaFire" >> $GITHUB_STEP_SUMMARY
-            echo "2. Ensure ROM is >1GB (not an HTML page)" >> $GITHUB_STEP_SUMMARY
-            echo "3. Verify ROM contains system.img or payload.bin" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Downloads" >> $GITHUB_STEP_SUMMARY
+          echo "Artifacts uploaded to workflow run" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ inputs.upload_artifacts }}" == "true" ]]; then
+            echo "Release created as draft" >> $GITHUB_STEP_SUMMARY
           fi
