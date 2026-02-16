@@ -83,12 +83,12 @@ jobs:
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platform-tools" > /dev/null 2>&1 || true
           
-          # Python tools
+          # Python tools - Install all dependencies first
           python -m pip install --upgrade pip
-          pip install aospdtgen dumpyara pyaxmlparser protobuf 2>/dev/null || true
+          pip install numpy protobuf  # Install numpy first!
+          pip install aospdtgen dumpyara pyaxmlparser
           
           # Install payload dumper for A/B OTA
-          pip install protobuf
           git clone --depth 1 https://github.com/vm03/payload_dumper.git /tmp/payload_dumper 2>/dev/null || true
 
       # ============================================================================
@@ -171,7 +171,7 @@ jobs:
             echo ""
             echo "📄 File content preview (first 1000 bytes):"
             echo "----------------------------------------"
-            head -c 1000 "$ROM_FILENAME" || true
+            head -c 1000 "$ROM_FILENAME"
             echo ""
             echo "----------------------------------------"
             echo ""
@@ -316,22 +316,50 @@ jobs:
               echo "🔧 Extracting super.img (Dynamic partitions)..."
               SUPER_IMG=$(ls "$EXTRACT_DIR"/[Ss]uper.img 2>/dev/null | head -1)
               if [ -n "$SUPER_IMG" ]; then
-                # Try unsuper first
-                pip install unsuper 2>/dev/null || true
-                if command -v unsuper &> /dev/null; then
-                  echo "   Using unsuper..."
-                  unsuper "$SUPER_IMG" "$WORK_DIR" 2>&1 | head -30 || true
-                else
-                  # Manual lpunpack approach
-                  echo "   Converting super.img..."
-                  simg2img "$SUPER_IMG" "$WORK_DIR/super.raw.img" 2>/dev/null || true
+                echo "   Found: $SUPER_IMG"
+                
+                # Convert sparse super.img to raw first
+                echo "   Converting sparse super.img to raw..."
+                simg2img "$SUPER_IMG" "$WORK_DIR/super.raw.img" 2>/dev/null || {
+                  echo "⚠️ simg2img failed, trying to copy as-is..."
+                  cp "$SUPER_IMG" "$WORK_DIR/super.raw.img" 2>/dev/null || true
+                }
+                
+                # Check if we got a raw image
+                if [ -f "$WORK_DIR/super.raw.img" ]; then
+                  echo "   ✅ Raw super image created"
                   
-                  # Try to use lpdump + lpunpack
-                  if command -v lpdump &> /dev/null; then
-                    echo "   Using lpdump to parse layout..."
-                    lpdump "$WORK_DIR/super.raw.img" > "$WORK_DIR/super.map" 2>/dev/null || true
+                  # Try to use lpunpack if available
+                  if command -v lpunpack &> /dev/null; then
+                    echo "   Using lpunpack to extract partitions..."
+                    cd "$WORK_DIR"
+                    lpunpack super.raw.img . 2>&1 | head -30 || {
+                      echo "⚠️ lpunpack failed, trying manual extraction..."
+                    }
+                    cd "$WORKSPACE"
                   fi
+                  
+                  # Try unsuper as alternative
+                  if command -v unsuper &> /dev/null; then
+                    echo "   Trying unsuper..."
+                    cd "$WORK_DIR"
+                    unsuper super.raw.img . 2>&1 | head -30 || {
+                      echo "⚠️ unsuper failed (this is OK if lpunpack worked)"
+                    }
+                    cd "$WORKSPACE"
+                  fi
+                  
+                  # Check if we extracted anything
+                  if ls "$WORK_DIR"/*.img 2>/dev/null | grep -q .; then
+                    echo "   ✅ Partitions extracted from super.img"
+                  else
+                    echo "   ⚠️ No partitions extracted, will try to mount super.img directly"
+                  fi
+                else
+                  echo "   ❌ Failed to create raw super image"
                 fi
+              else
+                echo "   ❌ super.img not found!"
               fi
               ;;
               
@@ -373,19 +401,37 @@ jobs:
           echo "🔄 Converting sparse images to raw..."
           cd "$WORK_DIR"
           
+          # List what we have before conversion
+          echo "   Files in work_dir before conversion:"
+          ls -lh *.img 2>/dev/null | head -20 || echo "   (No .img files found)"
+          
           # Convert all sparse images
           for img in *.img; do
             if [ -f "$img" ]; then
+              # Check if it's a sparse image
               if file "$img" | grep -q "sparse"; then
-                echo "   Converting: $img"
-                simg2img "$img" "${img%.img}.raw.img" 2>/dev/null && rm -f "$img" || true
+                echo "   Converting sparse: $img"
+                simg2img "$img" "${img%.img}.raw.img" 2>/dev/null && {
+                  rm -f "$img"
+                  echo "     ✅ Converted to ${img%.img}.raw.img"
+                } || {
+                  echo "     ⚠️ simg2img failed for $img"
+                  # Try to rename anyway in case it's already raw
+                  mv "$img" "${img%.img}.raw.img" 2>/dev/null || true
+                }
               else
-                # Already raw or not ext4, just rename
+                # Not sparse, just rename
+                echo "   Renaming to raw: $img"
                 mv "$img" "${img%.img}.raw.img" 2>/dev/null || true
               fi
             fi
           done
           
+          echo ""
+          echo "📂 Files after conversion:"
+          ls -lh *.raw.img 2>/dev/null | head -20 || echo "   (No raw images found)"
+          
+          # Mount raw images to extract contents
           echo ""
           echo "📂 Mounting partitions to extract contents..."
           mkdir -p "$WORKSPACE/mounted_partitions"
@@ -419,6 +465,31 @@ jobs:
             fi
           done
           
+          # Also try to mount super.raw.img directly if it exists and we haven't extracted partitions
+          if [ -f "$WORK_DIR/super.raw.img" ] && [ ! -d "$WORKSPACE/dump/system" ]; then
+            echo ""
+            echo "🔧 Attempting to mount super.raw.img directly..."
+            mount_point="$WORKSPACE/mounted_partitions/super"
+            mkdir -p "$mount_point"
+            
+            # Try to mount super partition
+            if sudo mount -o loop,ro -t auto "$WORK_DIR/super.raw.img" "$mount_point" 2>/dev/null; then
+              echo "   ✅ Mounted super partition"
+              # Look for logical partitions inside
+              for subpart in system vendor product system_ext odm; do
+                if [ -d "$mount_point/$subpart" ]; then
+                  echo "   📦 Found logical partition: $subpart"
+                  mkdir -p "$WORKSPACE/dump/$subpart"
+                  sudo cp -a "$mount_point/$subpart/." "$WORKSPACE/dump/$subpart/" 2>/dev/null || true
+                fi
+              done
+              sudo umount "$mount_point" 2>/dev/null || true
+            else
+              echo "   ⚠️ Could not mount super partition directly"
+              rmdir "$mount_point" 2>/dev/null || true
+            fi
+          fi
+          
           # Determine final dump path
           echo ""
           echo "🔍 Locating system partition..."
@@ -438,10 +509,15 @@ jobs:
               echo "   ✅ Found system at: $SYS_DIR"
             else
               echo "   ❌ No system partition found!"
-              echo "   📂 Available in dump:"
-              find "$WORKSPACE/dump" -type d -maxdepth 2 2>/dev/null || true
-              echo "   📂 Available in work_dir:"
-              ls -la "$WORK_DIR" 2>/dev/null || true
+              echo ""
+              echo "📂 Dump directory contents:"
+              find "$WORKSPACE/dump" -type f -o -type d 2>/dev/null | head -30 || echo "   (Empty or not found)"
+              echo ""
+              echo "📂 Work directory contents:"
+              ls -la "$WORK_DIR" 2>/dev/null || echo "   (Empty or not found)"
+              echo ""
+              echo "📂 Mounted partitions:"
+              ls -la "$WORKSPACE/mounted_partitions/" 2>/dev/null || echo "   (None)"
               exit 1
             fi
           fi
