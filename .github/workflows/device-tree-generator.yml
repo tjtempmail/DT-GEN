@@ -79,36 +79,11 @@ jobs:
         run: |
           echo "::group::Installing Python packages..."
           pip install --upgrade pip setuptools wheel
-          
-          # Install dumpyara from PyPI (not git)
-          pip install dumpyara
-          
-          # Install aospdtgen
-          pip install aospdtgen
-          
-          # Install twrpdtgen if needed
-          if [[ "${{ inputs.generate_twrp }}" == "true" ]]; then
-            pip install twrpdtgen
-          fi
-          
-          # Install dependencies
+          pip install dumpyara aospdtgen twrpdtgen
           pip install \
-            extract-dtb \
-            pycryptodome \
-            protobuf \
-            backports.lzma \
-            requests \
-            tqdm \
-            colorama \
-            lz4 \
-            zstandard \
-            pyyaml \
-            lxml
+            extract-dtb pycryptodome protobuf backports.lzma \
+            requests tqdm colorama lz4 zstandard pyyaml lxml
           echo "::endgroup::"
-          
-          # Verify
-          echo "✅ dumpyara: $(which dumpyara 2>/dev/null || pip show dumpyara | grep Version)"
-          echo "✅ aospdtgen: $(which aospdtgen 2>/dev/null || pip show aospdtgen | grep Version)"
 
       - name: ⬇️ Download Firmware
         id: download
@@ -122,7 +97,6 @@ jobs:
           [[ -z "$FILENAME" ]] && FILENAME="firmware.zip"
           
           echo "📥 Downloading: $FILENAME"
-          
           curl -L -o "$DOWNLOAD_DIR/$FILENAME" --progress-bar "${{ inputs.rom_url }}"
           
           if [[ ! -f "$DOWNLOAD_DIR/$FILENAME" ]]; then
@@ -144,44 +118,126 @@ jobs:
           mkdir -p "$DUMP_DIR"
           
           echo "🚀 Running dumpyara..."
-          echo "Input: $FIRMWARE_PATH"
-          echo "Output: $DUMP_DIR"
-          
           dumpyara "$FIRMWARE_PATH" "$DUMP_DIR" 2>&1 | tee "${{ env.OUTPUT_DIR }}/dumpyara.log"
           
-          # Find extracted directory
-          EXTRACTED_DIR=$(find "$DUMP_DIR" -maxdepth 3 -type d -name "system" | head -1 | xargs dirname 2>/dev/null || \
-                          find "$DUMP_DIR" -maxdepth 3 -type d -name "vendor" | head -1 | xargs dirname 2>/dev/null || \
-                          echo "$DUMP_DIR")
+          # Debug: Show dump directory structure
+          echo "📁 Dump directory structure:"
+          find "$DUMP_DIR" -maxdepth 3 -type d | head -20
           
-          if [[ ! -d "$EXTRACTED_DIR" ]]; then
-            echo "❌ Extraction failed!"
-            ls -laR "$DUMP_DIR"
+          # Find the correct extraction path
+          # dumpyara creates subdirectories like: dump/system/ or dump/[codename]/system/
+          EXTRACTED_DIR=""
+          
+          # Check various possible locations
+          if [[ -d "$DUMP_DIR/system" ]]; then
+            EXTRACTED_DIR="$DUMP_DIR"
+          elif [[ -d "$DUMP_DIR/system/system" ]]; then
+            EXTRACTED_DIR="$DUMP_DIR"
+          else
+            # Look for system directory deeper
+            SYS_DIR=$(find "$DUMP_DIR" -maxdepth 3 -type d -name "system" | head -1)
+            if [[ -n "$SYS_DIR" ]]; then
+              EXTRACTED_DIR=$(dirname "$SYS_DIR")
+            fi
+          fi
+          
+          # If still not found, check for payload.bin extraction results
+          if [[ -z "$EXTRACTED_DIR" ]] || [[ ! -d "$EXTRACTED_DIR/system" ]]; then
+            # Look for any directory containing build.prop
+            BUILD_PROP_DIR=$(find "$DUMP_DIR" -name "build.prop" -type f | head -1 | xargs dirname 2>/dev/null)
+            if [[ -n "$BUILD_PROP_DIR" ]]; then
+              # Go up to find system root
+              if [[ "$BUILD_PROP_DIR" == */system ]]; then
+                EXTRACTED_DIR=$(dirname "$BUILD_PROP_DIR")
+              else
+                EXTRACTED_DIR="$BUILD_PROP_DIR"
+              fi
+            fi
+          fi
+          
+          if [[ -z "$EXTRACTED_DIR" ]] || [[ ! -d "$EXTRACTED_DIR" ]]; then
+            echo "❌ Could not find valid extraction!"
+            echo "Dump contents:"
+            ls -laR "$DUMP_DIR" | head -50
             exit 1
           fi
           
-          echo "📁 Extracted to: $EXTRACTED_DIR"
+          echo "✅ Found extraction at: $EXTRACTED_DIR"
+          echo "Contents:"
           ls -la "$EXTRACTED_DIR"
           
+          # Check for system partition
+          if [[ ! -d "$EXTRACTED_DIR/system" ]]; then
+            echo "⚠️ Warning: No system directory found!"
+          fi
+          
           echo "extracted_path=$EXTRACTED_DIR" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+
+      - name: 🔧 Prepare for AOSP DT Gen
+        id: prepare
+        run: |
+          echo "::group::Preparing for aospdtgen..."
+          EXTRACTED_PATH="${{ steps.dumpyara.outputs.extracted_path }}"
+          PREPARED_DIR="${{ env.OUTPUT_DIR }}/prepared"
+          
+          mkdir -p "$PREPARED_DIR"
+          
+          # aospdtgen expects partitions as directories in the root
+          # Check if we need to reorganize
+          if [[ -d "$EXTRACTED_PATH/system" ]]; then
+            echo "✅ Partitions already in correct location"
+            PREPARED_PATH="$EXTRACTED_PATH"
+          else
+            echo "🔄 Reorganizing partition structure..."
+            # Find all partition images and mount/extract them if needed
+            # For now, symlink the found structure
+            ln -sf "$EXTRACTED_PATH" "$PREPARED_DIR/firmware"
+            PREPARED_PATH="$PREPARED_DIR/firmware"
+          fi
+          
+          # Debug: Show what aospdtgen will see
+          echo "📁 Final structure for aospdtgen:"
+          ls -la "$PREPARED_PATH"
+          if [[ -d "$PREPARED_PATH/system" ]]; then
+            echo "System partition contents:"
+            ls -la "$PREPARED_PATH/system" | head -20
+          fi
+          
+          echo "prepared_path=$PREPARED_PATH" >> $GITHUB_OUTPUT
           echo "::endgroup::"
 
       - name: 🌳 Generate AOSP Device Tree
         id: aospdtgen
         run: |
           echo "::group::Generating AOSP device tree..."
-          EXTRACTED_PATH="${{ steps.dumpyara.outputs.extracted_path }}"
+          PREPARED_PATH="${{ steps.prepare.outputs.prepared_path }}"
           DT_DIR="${{ env.OUTPUT_DIR }}/device-tree-aosp"
+          
           mkdir -p "$DT_DIR"
           
           echo "🌲 Running aospdtgen..."
-          echo "Input: $EXTRACTED_PATH"
+          echo "Input: $PREPARED_PATH"
           echo "Output: $DT_DIR"
           
-          aospdtgen -o "$DT_DIR" "$EXTRACTED_PATH" 2>&1 | tee "${{ env.OUTPUT_DIR }}/aospdtgen.log"
+          # Check if system exists
+          if [[ ! -d "$PREPARED_PATH/system" ]]; then
+            echo "❌ ERROR: system partition not found at $PREPARED_PATH/system"
+            echo "Available directories:"
+            find "$PREPARED_PATH" -maxdepth 2 -type d
+            exit 1
+          fi
+          
+          # Run aospdtgen
+          aospdtgen -o "$DT_DIR" "$PREPARED_PATH" 2>&1 | tee "${{ env.OUTPUT_DIR }}/aospdtgen.log"
           
           FILE_COUNT=$(find "$DT_DIR" -type f 2>/dev/null | wc -l)
           echo "✅ Generated $FILE_COUNT files"
+          
+          if [[ $FILE_COUNT -eq 0 ]]; then
+            echo "❌ No files generated!"
+            exit 1
+          fi
           
           echo "aosp_dt_path=$DT_DIR" >> $GITHUB_OUTPUT
           echo "aosp_file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
@@ -223,15 +279,14 @@ jobs:
           
           if [[ -d "device-tree-aosp" ]] && [[ "$(ls -A device-tree-aosp 2>/dev/null)" ]]; then
             tar -czf aosp-device-tree.tar.gz device-tree-aosp/
-            echo "✅ AOSP DT archived ($(du -h aosp-device-tree.tar.gz | cut -f1))"
+            echo "✅ AOSP DT: $(du -h aosp-device-tree.tar.gz | cut -f1)"
           fi
           
           if [[ -d "device-tree-twrp" ]] && [[ "$(ls -A device-tree-twrp 2>/dev/null)" ]]; then
             tar -czf twrp-device-tree.tar.gz device-tree-twrp/
-            echo "✅ TWRP DT archived ($(du -h twrp-device-tree.tar.gz | cut -f1))"
+            echo "✅ TWRP DT: $(du -h twrp-device-tree.tar.gz | cut -f1)"
           fi
           
-          # Create report
           cat > GENERATION_REPORT.md << EOF
           # Device Tree Generation Report
           
@@ -241,7 +296,7 @@ jobs:
           **TWRP Status**: ${{ steps.twrpdtgen.outputs.twrp_status || 'N/A' }}
           EOF
           
-          ls -lh *.tar.gz 2>/dev/null || echo "No archives created"
+          ls -lh *.tar.gz 2>/dev/null || echo "No archives"
           echo "::endgroup::"
 
       - name: ☁️ Upload Artifacts
@@ -255,19 +310,3 @@ jobs:
             ${{ env.OUTPUT_DIR }}/*.md
           retention-days: 30
           if-no-files-found: warn
-
-      - name: 📝 Job Summary
-        if: always()
-        run: |
-          echo "## 🤖 Device Tree Generation Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Step | Status | Details |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|--------|---------|" >> $GITHUB_STEP_SUMMARY
-          echo "| 📥 Download | ${{ steps.download.outcome }} | ${{ steps.download.outputs.firmware_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🗂️ Extraction | ${{ steps.dumpyara.outcome }} | ${{ steps.dumpyara.outputs.extracted_path }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🌳 AOSP DT | ${{ steps.aospdtgen.outcome }} | ${{ steps.aospdtgen.outputs.aosp_file_count }} files |" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ inputs.generate_twrp }}" == "true" ]]; then
-            echo "| 🔄 TWRP DT | ${{ steps.twrpdtgen.outcome }} | ${{ steps.twrpdtgen.outputs.twrp_status }} |" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "📦 [Download Artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
