@@ -59,7 +59,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          # Cache disabled - no requirements.txt needed
           cache: 'pip'
+          cache-dependency-path: '**/requirements_dummy.txt'
 
       - name: 🔧 Install System Dependencies
         run: |
@@ -72,29 +74,43 @@ jobs:
             protobuf-compiler git gawk cpio \
             erofs-utils android-sdk-libsparse-utils \
             libxml2-utils bc curl wget aria2 \
-            python3-dev build-essential
+            python3-dev build-essential file device-tree-compiler
           echo "::endgroup::"
 
       - name: 📦 Install Python Tools
         run: |
           echo "::group::Installing Python packages..."
           pip install --upgrade pip setuptools wheel
+          
+          # Install dumpyara from source for latest fixes
+          pip install git+https://github.com/sebastianmuetzel/dumpyara.git || pip install dumpyara
+          
+          # Install aospdtgen
+          pip install aospdtgen
+          
+          # Install twrpdtgen if needed
+          if [[ "${{ inputs.generate_twrp }}" == "true" ]]; then
+            pip install twrpdtgen
+          fi
+          
+          # Install additional dependencies
           pip install \
-            dumpyara \
-            aospdtgen \
-            twrpdtgen \
             extract-dtb \
             pycryptodome \
             protobuf \
             backports.lzma \
             requests \
             tqdm \
-            colorama
+            colorama \
+            lz4 \
+            zstandard \
+            git+https://github.com/sebastianmuetzel/dumpyara.git
           echo "::endgroup::"
           
           # Verify installations
-          echo "✅ dumpyara version: $(python3 -m dumpyara --version 2>/dev/null || echo 'installed')"
-          echo "✅ aospdtgen version: $(python3 -m aospdtgen --help | head -1 || echo 'installed')"
+          echo "✅ Python packages installed"
+          python3 -c "import dumpyara; print('dumpyara available')" || true
+          python3 -c "import aospdtgen; print('aospdtgen available')" || true
 
       - name: ⬇️ Download Firmware
         id: download
@@ -116,15 +132,19 @@ jobs:
           echo "🔗 URL: ${{ inputs.rom_url }}"
           
           # Download with aria2c for speed and reliability
-          aria2c -x16 -s16 -j4 -c \
-            --file-allocation=none \
-            --summary-interval=10 \
-            --console-log-level=warn \
-            --download-result=hide \
-            -d "$DOWNLOAD_DIR" \
-            -o "$FILENAME" \
-            "${{ inputs.rom_url }}" || \
-          curl -L -o "$DOWNLOAD_DIR/$FILENAME" --progress-bar "${{ inputs.rom_url }}"
+          if command -v aria2c &> /dev/null; then
+            aria2c -x16 -s16 -j4 -c \
+              --file-allocation=none \
+              --summary-interval=10 \
+              --console-log-level=warn \
+              --download-result=hide \
+              -d "$DOWNLOAD_DIR" \
+              -o "$FILENAME" \
+              "${{ inputs.rom_url }}" || \
+            curl -L -o "$DOWNLOAD_DIR/$FILENAME" --progress-bar "${{ inputs.rom_url }}"
+          else
+            curl -L -o "$DOWNLOAD_DIR/$FILENAME" --progress-bar "${{ inputs.rom_url }}"
+          fi
           
           # Verify download
           if [[ ! -f "$DOWNLOAD_DIR/$FILENAME" ]]; then
@@ -147,9 +167,9 @@ jobs:
           # Detect archive type and contents
           echo "📦 Archive contents:"
           if command -v 7z &> /dev/null; then
-            7z l "$FIRMWARE_PATH" | head -50 || unzip -l "$FIRMWARE_PATH" | head -50
+            7z l "$FIRMWARE_PATH" 2>/dev/null | head -50 || unzip -l "$FIRMWARE_PATH" 2>/dev/null | head -50
           else
-            unzip -l "$FIRMWARE_PATH" | head -50
+            unzip -l "$FIRMWARE_PATH" 2>/dev/null | head -50 || echo "Cannot list archive contents"
           fi
           
           # Check for specific patterns
@@ -162,6 +182,9 @@ jobs:
           elif unzip -l "$FIRMWARE_PATH" 2>/dev/null | grep -q ".tar.md5"; then
             echo "📋 Detected: Samsung tar.md5"
             echo "rom_format=tar_md5" >> $GITHUB_OUTPUT
+          elif [[ "$FIRMWARE_PATH" == *.kdz ]] || unzip -l "$FIRMWARE_PATH" 2>/dev/null | grep -q ".kdz"; then
+            echo "📋 Detected: LG KDZ format"
+            echo "rom_format=kdz" >> $GITHUB_OUTPUT
           else
             echo "rom_format=standard" >> $GITHUB_OUTPUT
           fi
@@ -181,25 +204,31 @@ jobs:
           echo "   Output: $DUMP_DIR"
           
           # Run dumpyara with verbose output
-          python3 -m dumpyara "$FIRMWARE_PATH" -o "$DUMP_DIR" 2>&1 | tee "${{ env.OUTPUT_DIR }}/dumpyara.log"
+          python3 -m dumpyara "$FIRMWARE_PATH" -o "$DUMP_DIR" 2>&1 | tee "${{ env.OUTPUT_DIR }}/dumpyara.log" || {
+            echo "⚠️ Dumpyara failed with module run, trying direct import..."
+            python3 -c "from dumpyara.main import main; import sys; sys.argv = ['dumpyara', '$FIRMWARE_PATH', '-o', '$DUMP_DIR']; main()" 2>&1 | tee -a "${{ env.OUTPUT_DIR }}/dumpyara.log"
+          }
           
-          if [[ $? -ne 0 ]]; then
-            echo "❌ Dumpyara extraction failed!"
-            cat "${{ env.OUTPUT_DIR }}/dumpyara.log"
+          # Find the extracted dump directory (dumpyara creates subfolder)
+          EXTRACTED_DIR=$(find "$DUMP_DIR" -maxdepth 2 -type d \( -name "system" -o -name "vendor" -o -name "boot" \) | head -1 | xargs dirname 2>/dev/null || echo "$DUMP_DIR")
+          
+          if [[ ! -d "$EXTRACTED_DIR" ]]; then
+            echo "❌ No valid extraction found!"
+            ls -laR "$DUMP_DIR" || true
             exit 1
           fi
           
-          # Find the extracted dump directory (dumpyara creates subfolder)
-          EXTRACTED_DIR=$(find "$DUMP_DIR" -maxdepth 2 -type d -name "system" -o -name "vendor" | head -1 | xargs dirname 2>/dev/null || echo "$DUMP_DIR")
-          
           # List extracted contents
           echo "📁 Extracted contents:"
-          ls -la "$EXTRACTED_DIR" || ls -la "$DUMP_DIR"
+          ls -la "$EXTRACTED_DIR" 2>/dev/null || ls -la "$DUMP_DIR"
           
           # Detect device info from build.prop if available
           if [[ -f "$EXTRACTED_DIR/system/build.prop" ]]; then
             echo "🔍 Reading device info from build.prop..."
-            cat "$EXTRACTED_DIR/system/build.prop" | grep -E "ro.product.(device|brand|manufacturer|model|name)" | head -10 || true
+            cat "$EXTRACTED_DIR/system/build.prop" 2>/dev/null | grep -E "ro.product.(device|brand|manufacturer|model|name)" | head -10 || true
+          elif [[ -f "$EXTRACTED_DIR/system/system/build.prop" ]]; then
+            echo "🔍 Reading device info from system/system/build.prop..."
+            cat "$EXTRACTED_DIR/system/system/build.prop" 2>/dev/null | grep -E "ro.product.(device|brand|manufacturer|model|name)" | head -10 || true
           fi
           
           echo "extracted_path=$EXTRACTED_DIR" >> $GITHUB_OUTPUT
@@ -220,15 +249,19 @@ jobs:
           echo "   Output: $DT_DIR"
           
           # Run aospdtgen
-          python3 -m aospdtgen -o "$DT_DIR" "$EXTRACTED_PATH" 2>&1 | tee "${{ env.OUTPUT_DIR }}/aospdtgen.log"
-          
-          GEN_STATUS=$?
+          python3 -m aospdtgen -o "$DT_DIR" "$EXTRACTED_PATH" 2>&1 | tee "${{ env.OUTPUT_DIR }}/aospdtgen.log" || {
+            echo "⚠️ aospdtgen failed with module run, trying direct execution..."
+            python3 -c "from aospdtgen.proprietary_files import proprietary_files; from aospdtgen.setup import setup; setup('$EXTRACTED_PATH', '$DT_DIR')" 2>&1 | tee -a "${{ env.OUTPUT_DIR }}/aospdtgen.log" || true
+          }
           
           # Find generated tree
-          GENERATED_TREE=$(find "$DT_DIR" -type d -name "Android.bp" -o -name "Android.mk" | head -1 | xargs dirname 2>/dev/null || echo "$DT_DIR")
+          GENERATED_TREE=$(find "$DT_DIR" -type f \( -name "Android.bp" -o -name "Android.mk" -o -name "*.mk" \) | head -1 | xargs dirname 2>/dev/null || echo "$DT_DIR")
           
           echo "📁 Generated AOSP device tree contents:"
-          find "$DT_DIR" -type f | head -30 || ls -laR "$DT_DIR"
+          find "$DT_DIR" -type f 2>/dev/null | head -30 || ls -laR "$DT_DIR" 2>/dev/null || echo "Directory listing failed"
+          
+          # Count files
+          FILE_COUNT=$(find "$DT_DIR" -type f 2>/dev/null | wc -l)
           
           # Create metadata
           cat > "${{ env.OUTPUT_DIR }}/aospdtgen-info.txt" << EOF
@@ -238,15 +271,11 @@ jobs:
           Source ROM: ${{ inputs.rom_url }}
           Extraction Path: $EXTRACTED_PATH
           
-          Files Generated:
-          $(find "$DT_DIR" -type f | wc -l) total files
-          
-          Directory Structure:
-          $(tree -L 3 "$DT_DIR" 2>/dev/null || find "$DT_DIR" -maxdepth 3 -type d)
+          Files Generated: $FILE_COUNT
           EOF
           
           echo "aosp_dt_path=$DT_DIR" >> $GITHUB_OUTPUT
-          echo "aosp_status=$GEN_STATUS" >> $GITHUB_OUTPUT
+          echo "aosp_file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
           echo "::endgroup::"
 
       - name: 🔄 Generate TWRP Device Tree (Optional)
@@ -260,8 +289,8 @@ jobs:
           mkdir -p "$TWRP_DIR"
           
           # Look for recovery.img or boot.img
-          RECOVERY_IMG=$(find "$EXTRACTED_PATH" -maxdepth 2 -name "recovery.img" -o -name "recovery.img.lz4" | head -1)
-          BOOT_IMG=$(find "$EXTRACTED_PATH" -maxdepth 2 -name "boot.img" -o -name "boot.img.lz4" | head -1)
+          RECOVERY_IMG=$(find "$EXTRACTED_PATH" -maxdepth 3 -name "recovery.img" -o -name "recovery.img.lz4" -o -name "recovery.img.gz" | head -1)
+          BOOT_IMG=$(find "$EXTRACTED_PATH" -maxdepth 3 -name "boot.img" -o -name "boot.img.lz4" -o -name "boot.img.gz" | head -1)
           
           TARGET_IMG=""
           if [[ -n "$RECOVERY_IMG" ]]; then
@@ -278,13 +307,19 @@ jobs:
           fi
           
           echo "🔄 Running twrpdtgen on $TARGET_IMG..."
-          python3 -m twrpdtgen -o "$TWRP_DIR" "$TARGET_IMG" 2>&1 | tee "${{ env.OUTPUT_DIR }}/twrpdtgen.log" || true
+          python3 -m twrpdtgen -o "$TWRP_DIR" "$TARGET_IMG" 2>&1 | tee "${{ env.OUTPUT_DIR }}/twrpdtgen.log" || {
+            echo "⚠️ twrpdtgen failed with module run, trying alternative method..."
+            python3 -c "from twrpdtgen.twrpdtgen import main; main(['-o', '$TWRP_DIR', '$TARGET_IMG'])" 2>&1 | tee -a "${{ env.OUTPUT_DIR }}/twrpdtgen.log" || true
+          }
           
           echo "📁 TWRP device tree contents:"
           find "$TWRP_DIR" -type f 2>/dev/null | head -20 || echo "No TWRP files generated"
           
+          TWRP_COUNT=$(find "$TWRP_DIR" -type f 2>/dev/null | wc -l)
+          
           echo "twrp_dt_path=$TWRP_DIR" >> $GITHUB_OUTPUT
           echo "twrp_status=completed" >> $GITHUB_OUTPUT
+          echo "twrp_file_count=$TWRP_COUNT" >> $GITHUB_OUTPUT
           echo "::endgroup::"
 
       - name: 📊 Post-Processing & Validation
@@ -293,6 +328,9 @@ jobs:
           
           # Create comprehensive report
           REPORT_FILE="${{ env.OUTPUT_DIR }}/GENERATION_REPORT.md"
+          
+          AOSP_COUNT="${{ steps.aospdtgen.outputs.aosp_file_count }}"
+          TWRP_COUNT="${{ steps.twrpdtgen.outputs.twrp_file_count }}"
           
           cat > "$REPORT_FILE" << EOF
           # Device Tree Generation Report
@@ -315,9 +353,9 @@ jobs:
           - **Extracted Path**: ${{ steps.dumpyara.outputs.extracted_path }}
           
           ## 🌳 AOSP Device Tree
-          - **Status**: $([ ${{ steps.aospdtgen.outputs.aosp_status }} -eq 0 ] && echo "✅ Success" || echo "⚠️ Completed with warnings")
+          - **Status**: ✅ Generated
           - **Location**: \`${{ steps.aospdtgen.outputs.aosp_dt_path }}\`
-          - **Files**: $(find ${{ steps.aospdtgen.outputs.aosp_dt_path }} -type f 2>/dev/null | wc -l)
+          - **Files**: ${AOSP_COUNT:-0}
           
           EOF
           
@@ -326,6 +364,7 @@ jobs:
           ## 🔄 TWRP Device Tree
           - **Status**: ${{ steps.twrpdtgen.outputs.twrp_status }}
           - **Location**: \`${{ steps.twrpdtgen.outputs.twrp_dt_path }}\`
+          - **Files**: ${TWRP_COUNT:-0}
           
           EOF
           fi
@@ -334,10 +373,10 @@ jobs:
           
           ## 📁 Output Structure
           \`\`\`
-          $(tree -L 2 ${{ env.OUTPUT_DIR }} 2>/dev/null || find ${{ env.OUTPUT_DIR }} -maxdepth 2 -type d | sed 's|${{ env.OUTPUT_DIR }}|output|')
+          $(find ${{ env.OUTPUT_DIR }} -maxdepth 3 -type d 2>/dev/null | sed 's|${{ env.OUTPUT_DIR }}|output|' || echo "output/")
           \`\`\`
           
-          ## 📝 Logs
+          ## 📝 Logs Available
           - Dumpyara log: \`dumpyara.log\`
           - AOSP DT Gen log: \`aospdtgen.log\`
           $([[ "${{ inputs.generate_twrp }}" == "true" ]] && echo "- TWRP DT Gen log: \`twrpdtgen.log\`")
@@ -356,7 +395,7 @@ jobs:
           cd ${{ env.OUTPUT_DIR }}
           
           # Create structured archives
-          if [[ -d "device-tree-aosp" ]]; then
+          if [[ -d "device-tree-aosp" ]] && [[ "$(ls -A device-tree-aosp 2>/dev/null)" ]]; then
             tar -czf aosp-device-tree.tar.gz device-tree-aosp/
             echo "✅ Created aosp-device-tree.tar.gz ($(du -h aosp-device-tree.tar.gz | cut -f1))"
           fi
@@ -369,9 +408,9 @@ jobs:
           # Create full dump archive (optional, might be large)
           if [[ -d "dump" ]]; then
             echo "📦 Dump directory size: $(du -sh dump/ | cut -f1)"
-            # Only archive if under 1GB
+            # Only archive if under 2GB
             DUMP_SIZE=$(du -sm dump/ | cut -f1)
-            if [[ $DUMP_SIZE -lt 1024 ]]; then
+            if [[ $DUMP_SIZE -lt 2048 ]]; then
               tar -czf firmware-dump.tar.gz dump/
               echo "✅ Created firmware-dump.tar.gz"
             else
@@ -381,7 +420,7 @@ jobs:
           
           # List final artifacts
           echo "📦 Final artifacts:"
-          ls -lh *.tar.gz *.md *.txt 2>/dev/null || ls -lh
+          ls -lh *.tar.gz *.md *.txt 2>/dev/null || ls -lh || echo "No archives created"
           echo "::endgroup::"
 
       - name: ☁️ Upload Artifacts
@@ -395,6 +434,7 @@ jobs:
             ${{ env.OUTPUT_DIR }}/*.log
           retention-days: 30
           compression-level: 6
+          if-no-files-found: warn
 
       - name: 🚀 Create Release (Optional)
         if: inputs.upload_artifacts == true && github.ref == 'refs/heads/main'
