@@ -1,0 +1,567 @@
+name: 📱 AOSP Device Tree Generator Pro
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: '🔗 Direct link to stock ROM ZIP (HTTP/HTTPS)'
+        required: true
+        type: string
+      rom_type:
+        description: '📦 ROM Type'
+        required: true
+        type: choice
+        options:
+          - 'payload.bin (A/B OTA)'
+          - 'sparse_ext4 (Full ROM)'
+          - 'sparse_raw (System.img)'
+          - 'br (Brotli compressed)'
+          - 'auto-detect'
+        default: 'auto-detect'
+      device_codename:
+        description: '🏷️ Device Codename (optional, auto-detected if empty)'
+        required: false
+        type: string
+      brand:
+        description: '🏢 Brand/Manufacturer (optional, auto-detected if empty)'
+        required: false
+        type: string
+      generate_proprietary:
+        description: '🔐 Generate proprietary-files.txt & extract-files.sh'
+        required: true
+        type: boolean
+        default: true
+      cleanup_after:
+        description: '🧹 Cleanup workspace after completion'
+        required: true
+        type: boolean
+        default: true
+
+env:
+  PYTHON_VERSION: '3.11'
+  WORKSPACE: ${{ github.workspace }}
+  OUTPUT_DIR: ${{ github.workspace }}/device_tree_output
+
+jobs:
+  generate-device-tree:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    
+    steps:
+      # ============================================================================
+      # STEP 1: Setup Environment
+      # ============================================================================
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 🛠️ Install System Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            aria2 \
+            p7zip-full \
+            p7zip-rar \
+            unrar \
+            unzip \
+            zip \
+            cpio \
+            file \
+            liblz4-tool \
+            brotli \
+            simg2img \
+            img2simg \
+            android-sdk-libsparse-utils \
+            erofs-utils \
+            f2fs-tools \
+            git \
+            curl \
+            wget \
+            bc \
+            xz-utils \
+            lzma \
+            gzip \
+            libxml2-utils \
+            python3-venv \
+            python3-pip
+
+      - name: 🔧 Setup Android Build Tools
+        run: |
+          # Install Android SDK Command Line Tools
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          cd $HOME/android-sdk/cmdline-tools
+          curl -sS https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o cmdline-tools.zip
+          unzip -q cmdline-tools.zip
+          mv cmdline-tools latest
+          
+          # Add to PATH
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
+          
+          # Accept licenses and install platform-tools
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" > /dev/null 2>&1 || true
+
+      # ============================================================================
+      # STEP 2: Install Python Tools (aospdtgen + dumpyara)
+      # ============================================================================
+      - name: 📦 Install Python Packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            aospdtgen \
+            dumpyara \
+            git+https://github.com/sebaubuntu-python/dumpyara.git \
+            requests \
+            tqdm \
+            humanize \
+            pyaxmlparser \
+            protobuf \
+            androguard \
+            beautifulsoup4 \
+            lxml
+
+      # ============================================================================
+      # STEP 3: Download ROM with Resume Support & Verification
+      # ============================================================================
+      - name: ⬇️ Download Stock ROM
+        id: download
+        run: |
+          ROM_URL="${{ github.event.inputs.rom_url }}"
+          ROM_FILENAME=$(basename "$ROM_URL" | sed 's/[?#].*$//')
+          
+          # If no extension or invalid, default to rom.zip
+          if [[ ! "$ROM_FILENAME" =~ \.(zip|tar|md5|lz4|br)$ ]]; then
+            ROM_FILENAME="rom.zip"
+          fi
+          
+          echo "📥 Downloading ROM..."
+          echo "URL: $ROM_URL"
+          echo "Filename: $ROM_FILENAME"
+          
+          # Create download directory
+          mkdir -p $WORKSPACE/rom_download
+          cd $WORKSPACE/rom_download
+          
+          # Download with aria2c (fast, resume support, multi-connection)
+          aria2c \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=1M \
+            --max-tries=5 \
+            --retry-wait=30 \
+            --timeout=600 \
+            --file-allocation=none \
+            --summary-interval=30 \
+            --console-log-level=warn \
+            --download-result=full \
+            -o "$ROM_FILENAME" \
+            "$ROM_URL"
+          
+          # Verify download
+          if [ ! -f "$ROM_FILENAME" ]; then
+            echo "❌ Download failed!"
+            exit 1
+          fi
+          
+          FILE_SIZE=$(stat -c%s "$ROM_FILENAME" 2>/dev/null || stat -f%z "$ROM_FILENAME")
+          echo "✅ Downloaded: $ROM_FILENAME ($(numfmt --to=iec-i $FILE_SIZE))"
+          
+          # Calculate checksums for verification
+          echo "🔐 Calculating checksums..."
+          md5sum "$ROM_FILENAME" > "${ROM_FILENAME}.md5"
+          sha256sum "$ROM_FILENAME" > "${ROM_FILENAME}.sha256"
+          
+          echo "rom_path=$WORKSPACE/rom_download/$ROM_FILENAME" >> $GITHUB_OUTPUT
+          echo "rom_filename=$ROM_FILENAME" >> $GITHUB_OUTPUT
+          echo "rom_size=$FILE_SIZE" >> $GITHUB_OUTPUT
+
+      # ============================================================================
+      # STEP 4: Extract ROM using dumpyara
+      # ============================================================================
+      - name: 🔓 Extract ROM (dumpyara)
+        id: extract
+        run: |
+          ROM_PATH="${{ steps.download.outputs.rom_path }}"
+          EXTRACT_DIR="$WORKSPACE/rom_extracted"
+          
+          mkdir -p "$EXTRACT_DIR"
+          
+          echo "🔓 Extracting ROM: $(basename "$ROM_PATH")"
+          echo "📂 Output: $EXTRACT_DIR"
+          
+          # Run dumpyara with progress
+          cd "$EXTRACT_DIR"
+          
+          # Detect and handle different ROM formats
+          if [[ "${{ github.event.inputs.rom_type }}" == "auto-detect" ]]; then
+            echo "🔍 Auto-detecting ROM format..."
+            python -m dumpyara "$ROM_PATH" "$EXTRACT_DIR" --output-format json 2>&1 | tee extraction.log
+          else
+            echo "📦 Using specified format: ${{ github.event.inputs.rom_type }}"
+            python -m dumpyara "$ROM_PATH" "$EXTRACT_DIR" 2>&1 | tee extraction.log
+          fi
+          
+          # Find the extracted dump directory (dumpyara creates subfolder)
+          DUMP_DIR=$(find "$EXTRACT_DIR" -maxdepth 2 -type d -name "*.dump" -o -type d -name "extracted*" 2>/dev/null | head -1)
+          
+          if [ -z "$DUMP_DIR" ] || [ ! -d "$DUMP_DIR" ]; then
+            # Fallback: use the directory with system/build.prop or vendor/build.prop
+            DUMP_DIR=$(find "$EXTRACT_DIR" -name "build.prop" -type f -exec dirname {} \; 2>/dev/null | head -1)
+          fi
+          
+          if [ -z "$DUMP_DIR" ] || [ ! -d "$DUMP_DIR" ]; then
+            echo "⚠️ Could not find standard dump structure, using extraction root"
+            DUMP_DIR="$EXTRACT_DIR"
+          fi
+          
+          echo "✅ Extraction complete"
+          echo "dump_path=$DUMP_DIR" >> $GITHUB_OUTPUT
+          
+          # Display extracted structure
+          echo "📁 Extracted structure:"
+          tree -L 2 "$DUMP_DIR" 2>/dev/null || find "$DUMP_DIR" -maxdepth 2 -type d | head -20
+
+      # ============================================================================
+      # STEP 5: Detect Device Info (if not provided)
+      # ============================================================================
+      - name: 🔍 Auto-Detect Device Information
+        id: device_info
+        run: |
+          DUMP_PATH="${{ steps.extract.outputs.dump_path }}"
+          
+          # Find build.prop files
+          BUILD_PROP=$(find "$DUMP_PATH" -name "build.prop" -type f 2>/dev/null | head -1)
+          VENDOR_PROP=$(find "$DUMP_PATH" -path "*/vendor/build.prop" -o -path "*/vendor/default.prop" 2>/dev/null | head -1)
+          SYSTEM_PROP=$(find "$DUMP_PATH" -path "*/system/build.prop" 2>/dev/null | head -1)
+          
+          echo "🔍 Scanning for device info..."
+          
+          # Extract device info using Python script
+          python3 << 'EOF'
+          import os
+          import re
+          import json
+          
+          def parse_prop(file_path):
+              props = {}
+              if os.path.exists(file_path):
+                  with open(file_path, 'r', errors='ignore') as f:
+                      for line in f:
+                          if '=' in line and not line.startswith('#'):
+                              key, val = line.strip().split('=', 1)
+                              props[key] = val
+              return props
+          
+          dump_path = os.environ.get('DUMP_PATH', '${{ steps.extract.outputs.dump_path }}')
+          
+          # Find all prop files
+          prop_files = []
+          for root, dirs, files in os.walk(dump_path):
+              for file in files:
+                  if file.endswith('.prop'):
+                      prop_files.append(os.path.join(root, file))
+          
+          all_props = {}
+          for pf in prop_files:
+              all_props.update(parse_prop(pf))
+          
+          # Extract key device info
+          device_info = {
+              'brand': all_props.get('ro.product.brand', all_props.get('ro.product.vendor.brand', 'unknown')),
+              'manufacturer': all_props.get('ro.product.manufacturer', all_props.get('ro.product.vendor.manufacturer', 'unknown')),
+              'device': all_props.get('ro.product.device', all_props.get('ro.product.vendor.device', 'unknown')),
+              'model': all_props.get('ro.product.model', all_props.get('ro.product.vendor.model', 'unknown')),
+              'codename': all_props.get('ro.product.name', all_props.get('ro.product.vendor.name', 'unknown')),
+              'android_version': all_props.get('ro.build.version.release', 'unknown'),
+              'sdk_version': all_props.get('ro.build.version.sdk', 'unknown'),
+              'security_patch': all_props.get('ro.build.version.security_patch', 'unknown'),
+              'fingerprint': all_props.get('ro.build.fingerprint', 'unknown'),
+              'platform': all_props.get('ro.board.platform', all_props.get('ro.hardware', 'unknown')),
+              'arch': all_props.get('ro.product.cpu.abi', 'unknown'),
+              'treble': all_props.get('ro.treble.enabled', 'false')
+          }
+          
+          # Write to GitHub outputs and file
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+              for key, val in device_info.items():
+                  safe_val = str(val).replace('\n', ' ').replace('\r', '')
+                  print(f"{key}={safe_val}", file=f)
+          
+          # Save full info
+          with open('device_info.json', 'w') as f:
+              json.dump(device_info, f, indent=2)
+          
+          print("📱 Device Information:")
+          print(json.dumps(device_info, indent=2))
+          EOF
+          
+          # Override with user inputs if provided
+          if [ -n "${{ github.event.inputs.device_codename }}" ]; then
+            echo "codename=${{ github.event.inputs.device_codename }}" >> $GITHUB_OUTPUT
+          fi
+          if [ -n "${{ github.event.inputs.brand }}" ]; then
+            echo "brand=${{ github.event.inputs.brand }}" >> $GITHUB_OUTPUT
+          fi
+
+      # ============================================================================
+      # STEP 6: Generate Device Tree using aospdtgen
+      # ============================================================================
+      - name: 🌳 Generate Device Tree (aospdtgen)
+        id: generate
+        run: |
+          DUMP_PATH="${{ steps.extract.outputs.dump_path }}"
+          OUTPUT_DIR="${{ env.OUTPUT_DIR }}"
+          
+          # Create output directory
+          mkdir -p "$OUTPUT_DIR"
+          
+          # Prepare aospdtgen arguments
+          AOSPDTGEN_ARGS="-o \"$OUTPUT_DIR\""
+          
+          if [[ "${{ github.event.inputs.generate_proprietary }}" == "false" ]]; then
+            AOSPDTGEN_ARGS="$AOSPDTGEN_ARGS --no-proprietary-files"
+          fi
+          
+          echo "🌳 Running aospdtgen..."
+          echo "📂 Input: $DUMP_PATH"
+          echo "📂 Output: $OUTPUT_DIR"
+          echo "⚙️ Args: $AOSPDTGEN_ARGS"
+          
+          # Run aospdtgen with error handling
+          cd "$WORKSPACE"
+          
+          if ! python -m aospdtgen $AOSPDTGEN_ARGS "$DUMP_PATH" 2>&1 | tee aospdtgen.log; then
+            echo "⚠️ aospdtgen encountered issues, checking output..."
+            # Continue even if there are non-fatal errors
+          fi
+          
+          # Verify output
+          if [ ! -d "$OUTPUT_DIR" ] || [ -z "$(ls -A "$OUTPUT_DIR" 2>/dev/null)" ]; then
+            echo "❌ No device tree generated!"
+            exit 1
+          fi
+          
+          # Find the generated device tree directory (usually device/brand/codename)
+          DEVICE_TREE_DIR=$(find "$OUTPUT_DIR" -type d -name "Android.bp" -o -type d -name "Android.mk" -o -type d -name "*.mk" 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo "$OUTPUT_DIR")
+          
+          echo "✅ Device tree generated successfully"
+          echo "output_path=$OUTPUT_DIR" >> $GITHUB_OUTPUT
+          
+          # List generated files
+          echo "📁 Generated files:"
+          find "$OUTPUT_DIR" -type f | head -30
+          
+          # Count files
+          FILE_COUNT=$(find "$OUTPUT_DIR" -type f | wc -l)
+          echo "📊 Total files generated: $FILE_COUNT"
+
+      # ============================================================================
+      # STEP 7: Post-Processing & Validation
+      # ============================================================================
+      - name: ✅ Validate & Post-Process Device Tree
+        run: |
+          OUTPUT_DIR="${{ env.OUTPUT_DIR }}"
+          BRAND="${{ steps.device_info.outputs.brand }}"
+          CODENAME="${{ steps.device_info.outputs.codename }}"
+          
+          echo "🔍 Validating device tree..."
+          
+          # Create validation report
+          cat > validation_report.txt << EOF
+          =========================================
+          DEVICE TREE VALIDATION REPORT
+          =========================================
+          Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Workflow Run: ${{ github.run_id }}
+          
+          DEVICE INFO:
+          - Brand: $BRAND
+          - Codename: $CODENAME
+          - Model: ${{ steps.device_info.outputs.model }}
+          - Android Version: ${{ steps.device_info.outputs.android_version }}
+          - Architecture: ${{ steps.device_info.outputs.arch }}
+          - Treble Enabled: ${{ steps.device_info.outputs.treble }}
+          
+          GENERATED FILES:
+          EOF
+          
+          # Check for essential files
+          ESSENTIAL_FILES=(
+            "Android.bp"
+            "Android.mk"
+            "BoardConfig.mk"
+            "device.mk"
+            "extract-files.sh"
+            "setup-makefiles.sh"
+            "proprietary-files.txt"
+          )
+          
+          for file in "${ESSENTIAL_FILES[@]}"; do
+            if find "$OUTPUT_DIR" -name "$file" -type f | grep -q .; then
+              echo "✅ $file: Found" >> validation_report.txt
+            else
+              echo "⚠️ $file: Not found" >> validation_report.txt
+            fi
+          done
+          
+          # Check for vendor blobs reference
+          if find "$OUTPUT_DIR" -name "*vendor*" -o -name "*proprietary*" | grep -q .; then
+            echo "✅ Vendor blobs handling: Configured" >> validation_report.txt
+          fi
+          
+          # Generate file tree
+          echo "" >> validation_report.txt
+          echo "DIRECTORY STRUCTURE:" >> validation_report.txt
+          tree "$OUTPUT_DIR" >> validation_report.txt 2>/dev/null || find "$OUTPUT_DIR" -print | sed -e 's;[^/]*/;|____;g;s;____|; |;g' >> validation_report.txt
+          
+          cat validation_report.txt
+          mv validation_report.txt "$OUTPUT_DIR/"
+
+      # ============================================================================
+      # STEP 8: Create Release Artifacts
+      # ============================================================================
+      - name: 📦 Package & Upload Artifacts
+        run: |
+          OUTPUT_DIR="${{ env.OUTPUT_DIR }}"
+          BRAND="${{ steps.device_info.outputs.brand }}"
+          CODENAME="${{ steps.device_info.outputs.codename }}"
+          ANDROID_VER="${{ steps.device_info.outputs.android_version }}"
+          
+          # Create sanitized filename
+          SAFE_BRAND=$(echo "$BRAND" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')
+          SAFE_CODENAME=$(echo "$CODENAME" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')
+          
+          PACKAGE_NAME="device_${SAFE_BRAND}_${SAFE_CODENAME}-android${ANDROID_VER}-dtgen"
+          
+          echo "📦 Creating artifact package: $PACKAGE_NAME"
+          
+          # Create zip archive
+          cd "$OUTPUT_DIR"
+          zip -r9 "$WORKSPACE/${PACKAGE_NAME}.zip" . -x "*.git*" "*.github*"
+          
+          # Create tarball for better compression
+          tar -czf "$WORKSPACE/${PACKAGE_NAME}.tar.gz" -C "$OUTPUT_DIR" .
+          
+          # Create info file
+          cat > "$WORKSPACE/${PACKAGE_NAME}-info.txt" << EOF
+          Device Tree Generation Report
+          =============================
+          
+          Generation Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Source ROM: ${{ github.event.inputs.rom_url }}
+          
+          Device Information:
+          - Brand: ${{ steps.device_info.outputs.brand }}
+          - Manufacturer: ${{ steps.device_info.outputs.manufacturer }}
+          - Device: ${{ steps.device_info.outputs.device }}
+          - Codename: ${{ steps.device_info.outputs.codename }}
+          - Model: ${{ steps.device_info.outputs.model }}
+          - Android Version: ${{ steps.device_info.outputs.android_version }}
+          - SDK Version: ${{ steps.device_info.outputs.sdk_version }}
+          - Security Patch: ${{ steps.device_info.outputs.security_patch }}
+          - Build Fingerprint: ${{ steps.device_info.outputs.fingerprint }}
+          - Platform: ${{ steps.device_info.outputs.platform }}
+          - Architecture: ${{ steps.device_info.outputs.arch }}
+          - Treble Enabled: ${{ steps.device_info.outputs.treble }}
+          
+          ROM Processing:
+          - Original Size: ${{ steps.download.outputs.rom_size }} bytes
+          - Filename: ${{ steps.download.outputs.rom_filename }}
+          
+          Generated by: aospdtgen (https://github.com/sebaubuntu-python/aospdtgen)
+          Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          
+          # Move artifacts to known location
+          mkdir -p "$WORKSPACE/artifacts"
+          mv "$WORKSPACE/${PACKAGE_NAME}.zip" "$WORKSPACE/artifacts/"
+          mv "$WORKSPACE/${PACKAGE_NAME}.tar.gz" "$WORKSPACE/artifacts/"
+          mv "$WORKSPACE/${PACKAGE_NAME}-info.txt" "$WORKSPACE/artifacts/"
+          
+          echo "✅ Artifacts prepared"
+          ls -lh "$WORKSPACE/artifacts/"
+
+      # ============================================================================
+      # STEP 9: Upload to GitHub Artifacts
+      # ============================================================================
+      - name: ☁️ Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-tree-${{ steps.device_info.outputs.brand }}-${{ steps.device_info.outputs.codename }}
+          path: ${{ github.workspace }}/artifacts/*
+          retention-days: 30
+          compression-level: 0  # Already compressed
+
+      # ============================================================================
+      # STEP 10: Create GitHub Release (Optional - for tagged runs)
+      # ============================================================================
+      - name: 🏷️ Create Release
+        if: github.ref_type == 'tag' || contains(github.event.inputs.rom_url, 'release')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ github.workspace }}/artifacts/*
+          name: "Device Tree: ${{ steps.device_info.outputs.brand }} ${{ steps.device_info.outputs.model }} (${{ steps.device_info.outputs.codename }})"
+          body: |
+            ## 📱 Device Tree for ${{ steps.device_info.outputs.brand }} ${{ steps.device_info.outputs.model }}
+            
+            **Codename:** `${{ steps.device_info.outputs.codename }}`  
+            **Android Version:** ${{ steps.device_info.outputs.android_version }}  
+            **Architecture:** ${{ steps.device_info.outputs.arch }}
+            
+            ### 🔧 Generated Files
+            - Device configuration (BoardConfig.mk, device.mk)
+            - Vendor blob extraction scripts
+            - Proprietary files list
+            - Sepolicy configurations
+            
+            ### 📥 Source
+            - **ROM URL:** ${{ github.event.inputs.rom_url }}
+            - **Fingerprint:** `${{ steps.device_info.outputs.fingerprint }}`
+            
+            ### ⚠️ Notes
+            This device tree was automatically generated using [aospdtgen](https://github.com/sebaubuntu-python/aospdtgen).
+            Manual review and adjustments may be required for production builds.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ============================================================================
+      # STEP 11: Cleanup (Optional)
+      # ============================================================================
+      - name: 🧹 Cleanup Workspace
+        if: ${{ github.event.inputs.cleanup_after == 'true' }}
+        run: |
+          echo "🧹 Cleaning up..."
+          rm -rf "$WORKSPACE/rom_download"
+          rm -rf "$WORKSPACE/rom_extracted"
+          rm -rf "${{ env.OUTPUT_DIR }}"
+          echo "✅ Cleanup complete"
+          df -h
+
+      # ============================================================================
+      # STEP 12: Summary
+      # ============================================================================
+      - name: 📋 Job Summary
+        run: |
+          echo "## 📱 Device Tree Generation Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Brand** | ${{ steps.device_info.outputs.brand }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Codename** | ${{ steps.device_info.outputs.codename }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Model** | ${{ steps.device_info.outputs.model }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Android** | ${{ steps.device_info.outputs.android_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Architecture** | ${{ steps.device_info.outputs.arch }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Treble** | ${{ steps.device_info.outputs.treble }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- Device Tree ZIP" >> $GITHUB_STEP_SUMMARY
+          echo "- Device Tree TAR.GZ" >> $GITHUB_STEP_SUMMARY
+          echo "- Device Info Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 [View Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
