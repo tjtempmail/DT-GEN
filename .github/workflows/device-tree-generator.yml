@@ -64,8 +64,6 @@ jobs:
         run: |
           echo "::group::Installing system packages..."
           sudo apt-get update -qq
-          
-          # Install packages with error handling
           sudo apt-get install -y -qq \
             unace unrar zip unzip p7zip-full p7zip-rar \
             sharutils rar uudeview mpack arj cabextract \
@@ -75,9 +73,6 @@ jobs:
             libxml2-utils bc curl wget \
             python3-dev build-essential file device-tree-compiler \
             || echo "Some packages failed, continuing..."
-          
-          # img2simg is part of android-sdk-libsparse-utils as simg2img
-          which simg2img || echo "simg2img not found"
           echo "::endgroup::"
 
       - name: 📦 Install Python Tools
@@ -85,8 +80,8 @@ jobs:
           echo "::group::Installing Python packages..."
           pip install --upgrade pip setuptools wheel
           
-          # Install dumpyara from git
-          pip install git+https://github.com/sebastianmuetzel/dumpyara.git
+          # Install dumpyara from PyPI (not git)
+          pip install dumpyara
           
           # Install aospdtgen
           pip install aospdtgen
@@ -110,6 +105,10 @@ jobs:
             pyyaml \
             lxml
           echo "::endgroup::"
+          
+          # Verify
+          echo "✅ dumpyara: $(which dumpyara 2>/dev/null || pip show dumpyara | grep Version)"
+          echo "✅ aospdtgen: $(which aospdtgen 2>/dev/null || pip show aospdtgen | grep Version)"
 
       - name: ⬇️ Download Firmware
         id: download
@@ -124,7 +123,6 @@ jobs:
           
           echo "📥 Downloading: $FILENAME"
           
-          # Download with curl
           curl -L -o "$DOWNLOAD_DIR/$FILENAME" --progress-bar "${{ inputs.rom_url }}"
           
           if [[ ! -f "$DOWNLOAD_DIR/$FILENAME" ]]; then
@@ -146,6 +144,9 @@ jobs:
           mkdir -p "$DUMP_DIR"
           
           echo "🚀 Running dumpyara..."
+          echo "Input: $FIRMWARE_PATH"
+          echo "Output: $DUMP_DIR"
+          
           dumpyara "$FIRMWARE_PATH" "$DUMP_DIR" 2>&1 | tee "${{ env.OUTPUT_DIR }}/dumpyara.log"
           
           # Find extracted directory
@@ -174,6 +175,9 @@ jobs:
           mkdir -p "$DT_DIR"
           
           echo "🌲 Running aospdtgen..."
+          echo "Input: $EXTRACTED_PATH"
+          echo "Output: $DT_DIR"
+          
           aospdtgen -o "$DT_DIR" "$EXTRACTED_PATH" 2>&1 | tee "${{ env.OUTPUT_DIR }}/aospdtgen.log"
           
           FILE_COUNT=$(find "$DT_DIR" -type f 2>/dev/null | wc -l)
@@ -217,17 +221,27 @@ jobs:
           echo "::group::Packaging..."
           cd ${{ env.OUTPUT_DIR }}
           
-          # Create archives
           if [[ -d "device-tree-aosp" ]] && [[ "$(ls -A device-tree-aosp 2>/dev/null)" ]]; then
             tar -czf aosp-device-tree.tar.gz device-tree-aosp/
-            echo "✅ AOSP DT archived"
+            echo "✅ AOSP DT archived ($(du -h aosp-device-tree.tar.gz | cut -f1))"
           fi
           
           if [[ -d "device-tree-twrp" ]] && [[ "$(ls -A device-tree-twrp 2>/dev/null)" ]]; then
             tar -czf twrp-device-tree.tar.gz device-tree-twrp/
-            echo "✅ TWRP DT archived"
+            echo "✅ TWRP DT archived ($(du -h twrp-device-tree.tar.gz | cut -f1))"
           fi
           
+          # Create report
+          cat > GENERATION_REPORT.md << EOF
+          # Device Tree Generation Report
+          
+          **ROM**: ${{ inputs.rom_url }}  
+          **Date**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")  
+          **AOSP Files**: ${{ steps.aospdtgen.outputs.aosp_file_count }}  
+          **TWRP Status**: ${{ steps.twrpdtgen.outputs.twrp_status || 'N/A' }}
+          EOF
+          
+          ls -lh *.tar.gz 2>/dev/null || echo "No archives created"
           echo "::endgroup::"
 
       - name: ☁️ Upload Artifacts
@@ -238,5 +252,22 @@ jobs:
           path: |
             ${{ env.OUTPUT_DIR }}/*.tar.gz
             ${{ env.OUTPUT_DIR }}/*.log
+            ${{ env.OUTPUT_DIR }}/*.md
           retention-days: 30
           if-no-files-found: warn
+
+      - name: 📝 Job Summary
+        if: always()
+        run: |
+          echo "## 🤖 Device Tree Generation Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 📥 Download | ${{ steps.download.outcome }} | ${{ steps.download.outputs.firmware_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🗂️ Extraction | ${{ steps.dumpyara.outcome }} | ${{ steps.dumpyara.outputs.extracted_path }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌳 AOSP DT | ${{ steps.aospdtgen.outcome }} | ${{ steps.aospdtgen.outputs.aosp_file_count }} files |" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ inputs.generate_twrp }}" == "true" ]]; then
+            echo "| 🔄 TWRP DT | ${{ steps.twrpdtgen.outcome }} | ${{ steps.twrpdtgen.outputs.twrp_status }} |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📦 [Download Artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
