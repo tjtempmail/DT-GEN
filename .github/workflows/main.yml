@@ -17,6 +17,10 @@ on:
         default: false
         type: boolean
 
+env:
+  # Tell GitPython where to find the git executable
+  GIT_PYTHON_GIT_EXECUTABLE: /usr/bin/git
+
 jobs:
   generate:
     runs-on: ubuntu-latest
@@ -31,6 +35,12 @@ jobs:
             curl wget unzip p7zip-full lz4 xz-utils \
             git file \
             && rm -rf /var/lib/apt/lists/*
+        shell: bash
+
+      - name: Verify git installation
+        run: |
+          which git
+          git --version
         shell: bash
 
       - name: Set up Python virtual environment
@@ -56,14 +66,11 @@ jobs:
             exit 1
           fi
           
-          # Check file size
           SIZE=$(stat -c %s rom.zip)
           echo "Downloaded file size: $SIZE bytes"
           
-          # ROM should be at least 100 MB (adjust threshold as needed)
           if [ $SIZE -lt 100000000 ]; then
             echo "::warning::Downloaded file is very small (${SIZE} bytes). It might not be a valid ROM."
-            # Optionally check MIME type
             MIME=$(file --mime-type -b rom.zip)
             if [ "$MIME" != "application/zip" ]; then
               echo "::error::Downloaded file is not a ZIP (MIME: $MIME). The URL may not be a direct download link."
